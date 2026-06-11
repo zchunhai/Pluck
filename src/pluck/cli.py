@@ -13,6 +13,7 @@ import argparse
 import logging
 import signal
 import sys
+import types
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,27 +25,29 @@ from pluck.config import (
     get_install_dir,
     get_repos_dir,
     load_config,
+    validate_plugin_name,
 )
 from pluck.installer import (
     get_installed_plugins,
     install_plugin,
     uninstall_plugin,
 )
-from pluck.interactive import interactive_select
 from pluck.interactive import save_config as save_interactive_config
 from pluck.repo import clone_or_update, discover_components
+from pluck.tab_ui import interactive_select
 
 logger = logging.getLogger("pluck")
 
 
-def _sigint_handler(signum: int, frame: object) -> None:
+def _sigint_handler(signum: int, frame: types.FrameType | None) -> None:
     """Handle Ctrl+C gracefully."""
-    print("\n\n⚠  Interrupted.")
     sys.exit(130)
 
 
 def main() -> None:
     """Main CLI entry point."""
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     parser = argparse.ArgumentParser(
         prog="pluck",
         description="Selective Claude plugin installer",
@@ -58,6 +61,35 @@ def main() -> None:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # --- env ---
+    env_p = subparsers.add_parser("env", help="Manage isolated environments")
+    env_sub = env_p.add_subparsers(dest="env_command", help="Available env actions")
+
+    env_create = env_sub.add_parser("create", help="Create a new environment")
+    env_create.add_argument("name", help="Environment name")
+    env_create.add_argument(
+        "--path",
+        help="Custom directory path (default: ~/.claude-envs/<name>)",
+    )
+
+    env_sub.add_parser("list", help="List all environments")
+
+    env_switch = env_sub.add_parser("switch", help="Activate an environment")
+    env_switch.add_argument("name", help="Environment to switch to")
+
+    env_sub.add_parser("deactivate", help="Deactivate the current environment")
+
+    env_init = env_sub.add_parser("init", help="Generate shell wrapper for auto-switching")
+    env_init.add_argument(
+        "--shell", choices=["zsh", "bash"], default="zsh",
+        help="Target shell (default: zsh)",
+    )
+
+    env_sub.add_parser("current", help="Show the currently active environment")
+
+    env_delete = env_sub.add_parser("delete", help="Delete an environment")
+    env_delete.add_argument("name", help="Environment to delete")
 
     # --- install ---
     install_p = subparsers.add_parser("install", help="Install plugins from config")
@@ -116,14 +148,13 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    signal.signal(signal.SIGINT, _sigint_handler)
-
     claude_dir = get_claude_config_dir()
     ensure_config_file(get_default_config_path())
     logger.debug("Claude config dir: %s", claude_dir)
 
     try:
         handlers = {
+            "env": lambda: cmd_env(args, claude_dir),
             "install": lambda: cmd_install(args, claude_dir),
             "update": lambda: cmd_update(args, claude_dir),
             "uninstall": lambda: cmd_uninstall(args, claude_dir),
@@ -132,8 +163,8 @@ def main() -> None:
             "status": lambda: cmd_status(args, claude_dir),
         }
         handlers[args.command]()
-    except Exception as e:
-        logger.error("Error: %s", e)
+    except (ValueError, RuntimeError, ImportError, OSError) as e:
+        logger.error("%s: %s", type(e).__name__, e)
         if args.verbose:
             import traceback
 
@@ -142,9 +173,10 @@ def main() -> None:
 
 
 def _extract_plugin_name(repo_url: str) -> str:
-    """Extract plugin name from a git repo URL.
+    """Extract plugin name from a git repo URL (always lowercased).
 
     Examples:
+        https://github.com/affaan-m/ECC.git     -> ecc
         https://github.com/obra/superpowers.git -> superpowers
         git@github.com:obra/superpowers.git      -> superpowers
     """
@@ -152,12 +184,14 @@ def _extract_plugin_name(repo_url: str) -> str:
     name = clean.rsplit("/", maxsplit=1)[-1]
     if ":" in name:
         name = name.rsplit(":", maxsplit=1)[-1]
-    return name
+    return name.lower()
 
 
 def _ensure_repo_in_config(args: argparse.Namespace) -> None:
     """Add a plugin from --repo URL to config file if not already present."""
-    name = args.plugin or _extract_plugin_name(args.repo)
+    name = validate_plugin_name(
+        args.plugin or _extract_plugin_name(args.repo)
+    )
     config_path = get_default_config_path()
 
     config = load_config()
@@ -220,7 +254,11 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
             or (args.plugin and plugin["name"] == args.plugin)
         )
         if is_repo_plugin and not args.install_all:
-            logger.info("  Select components interactively (Enter = skip)...")
+            logger.info(
+                "  Interactive selection:\n"
+                "    [Tab] switch type  [Space] toggle  [a] all  [Enter] confirm\n"
+                "    (or use: pluck install --repo <URL> --all)"
+            )
             new_components = interactive_select(
                 plugin["name"], repo_dir, plugin["components"]
             )
@@ -309,15 +347,16 @@ def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
 
     if changed:
         save_interactive_config(get_default_config_path(), config["plugins"])
+        logger.info("✅ Selection saved.")
         logger.info("")
 
-        if args.install:
-            logger.info("Installing updated selections...")
-            for plugin in _filter_plugins(config, args.plugin):
-                repo_dir = repos_dir / plugin["name"]
-                install_plugin(plugin, repo_dir, claude_dir)
-                logger.info("  ✅ '%s' installed\n", plugin["name"])
-    else:
+    if args.install:
+        logger.info("Installing...")
+        for plugin in _filter_plugins(config, args.plugin):
+            repo_dir = repos_dir / plugin["name"]
+            install_plugin(plugin, repo_dir, claude_dir)
+            logger.info("  ✅ '%s' installed\n", plugin["name"])
+    elif not changed:
         logger.info("No changes to save.")
 
 
@@ -409,6 +448,92 @@ def cmd_status(args: argparse.Namespace, claude_dir: Path) -> None:
         logger.info("")
 
 
+def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
+    """Handle 'env' command — environment management."""
+    from pluck.env import (
+        create_env,
+        deactivate_command,
+        delete_env,
+        get_current_env,
+        init_command,
+        list_envs,
+        switch_env_command,
+    )
+
+    if args.env_command == "create":
+        env_path = Path(args.path) if args.path else None
+        try:
+            created = create_env(args.name, path=env_path)
+            logger.info("Created environment '%s' at: %s", args.name, created)
+            # Output the switch command to stdout so that
+            #   eval "$(pluck env create <name>)"
+            # creates AND activates in one step.
+            sys.stdout.write(switch_env_command(args.name) + "\n")
+            sys.stdout.flush()
+        except ValueError as e:
+            logger.error("Cannot create environment: %s", e)
+            raise
+
+    elif args.env_command == "list":
+        envs = list_envs()
+        if not envs:
+            logger.info("No environments created yet.")
+            logger.info("Create one with: pluck env create <name>")
+            return
+
+        current = get_current_env()
+        current_path = str(current["path"]) if current else None
+
+        logger.info("Environments:")
+        for env in envs:
+            active = "*" if env["path"] == current_path else " "
+            logger.info("  %s %-20s %s", active, env["name"], env["path"])
+
+    elif args.env_command == "switch":
+        if not args.name:
+            logger.error("Environment name required for switch")
+            return
+        try:
+            cmd = switch_env_command(args.name)
+            sys.stdout.write(cmd + "\n")
+            sys.stdout.flush()
+        except ValueError as e:
+            print(f"pluck: {type(e).__name__}: {e}", file=sys.stderr)
+
+    elif args.env_command == "deactivate":
+        cmd = deactivate_command()
+        sys.stdout.write(cmd + "\n")
+        sys.stdout.flush()
+
+    elif args.env_command == "init":
+        cmd = init_command(args.shell)
+        sys.stdout.write(cmd + "\n")
+        sys.stdout.flush()
+
+    elif args.env_command == "current":
+        current = get_current_env()
+        if current:
+            logger.info("Active environment: %s", current["name"])
+            logger.info("Path:             %s", current["path"])
+            logger.info("Created:          %s", current.get("created_at", "unknown"))
+        else:
+            logger.info("No pluck environment active.")
+            logger.info("Using default Claude config: %s", claude_dir)
+
+    elif args.env_command == "delete":
+        try:
+            delete_env(args.name)
+            logger.info("Deleted environment '%s'", args.name)
+        except ValueError as e:
+            logger.error("Cannot delete: %s", e)
+            raise
+
+    else:
+        logger.error(
+            "Unknown env action. Available: create, list, switch, deactivate, init, current, delete"
+        )
+
+
 def _scan_installed_components(
     claude_dir: Path, plugin_name: str
 ) -> dict[str, set[str]]:
@@ -439,7 +564,12 @@ def _scan_installed_components(
             if child.is_dir():
                 items.add(child.name)
             elif child.is_file() and child.suffix == ".md":
-                items.add(child.stem)
+                # agents and commands use stem (no .md); contexts and rules
+                # keep the full filename to match discovery naming.
+                if comp_type in ("agents", "commands"):
+                    items.add(child.stem)
+                else:
+                    items.add(child.name)
             elif child.is_file():
                 items.add(child.name)
         result[comp_type] = items

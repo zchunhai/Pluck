@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from pluck.config import MARKETPLACE_NAME, get_claude_config_dir, get_install_dir
+from pluck.config import (
+    CONFIG_FILE_NAME,
+    MARKETPLACE_NAME,
+    get_claude_config_dir,
+    get_install_dir,
+    validate_plugin_name,
+)
 from pluck.repo import discover_components, get_commit_sha, resolve_component_paths
 
 logger = logging.getLogger(__name__)
@@ -40,19 +46,21 @@ def _atomic_write_json(path: Path, data: dict, indent: int = 2) -> None:
         backup = path.with_suffix(".json.bak")
         shutil.copy2(path, backup)
 
-    # Write to temp file in same directory (same filesystem for os.replace)
     fd, tmp_path = tempfile.mkstemp(
         suffix=".tmp", prefix=".pluck_", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=indent, ensure_ascii=False)
-    except BaseException:
+        os.replace(tmp_path, path)
+    except Exception:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
-
-        raise
+    finally:
+        if os.path.exists(tmp_path):
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
 
 def _safe_load_json(path: Path) -> dict[str, Any]:
@@ -69,6 +77,22 @@ def _safe_load_json(path: Path) -> dict[str, Any]:
         raise
 
 
+def _ensure_path_within_base(target: Path, base: Path) -> Path:
+    """Resolve ``target`` and verify it lies within ``base``.
+
+    Returns the resolved path.  Raises ``ValueError`` if the resolved
+    target escapes the allowed base directory.
+    """
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(base.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Path escapes allowed directory: {target} -> {resolved}"
+        ) from None
+    return resolved
+
+
 def install_plugin(
     plugin_config: dict[str, Any],
     repo_dir: Path,
@@ -83,12 +107,15 @@ def install_plugin(
         Path to the installed plugin directory.
     """
     claude_config_dir = claude_config_dir or get_claude_config_dir()
-    name = plugin_config["name"]
+    name = validate_plugin_name(plugin_config["name"])
     components = plugin_config["components"]
 
     _check_conflicts(name, claude_config_dir)
 
-    install_dir = get_install_dir(name, claude_config_dir)
+    plugins_base = (claude_config_dir / "plugins" / MARKETPLACE_NAME).resolve()
+    install_dir = _ensure_path_within_base(
+        get_install_dir(name, claude_config_dir), plugins_base
+    )
 
     if install_dir.exists():
         shutil.rmtree(install_dir)
@@ -96,6 +123,7 @@ def install_plugin(
     install_dir.mkdir(parents=True, exist_ok=True)
 
     _create_plugin_manifest(install_dir, name, repo_dir)
+    _create_marketplace_manifest(install_dir, name, claude_config_dir)
     _copy_plugin_metadata(repo_dir, install_dir)
 
     installed_count = 0
@@ -190,23 +218,137 @@ def _create_plugin_manifest(install_dir: Path, name: str, repo_dir: Path) -> Non
     with open(manifest_dir / "plugin.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    marketplace = {
-        "name": f"{name}-pluck",
-        "description": "Pluck-managed selective installation",
-        "owner": {"name": "pluck"},
-        "plugins": [
-            {
-                "name": name,
-                "description": manifest["description"],
-                "version": manifest["version"],
-                "source": "./",
-                "author": manifest["author"],
-            }
-        ],
+
+def _create_marketplace_manifest(
+    install_dir: Path, name: str, claude_config_dir: Path
+) -> None:
+    """Create or update the marketplace manifest for pluck.
+
+    Claude Code discovers local marketplaces via:
+      <marketplace-dir>/.claude-plugin/marketplace.json
+
+    Each plugin entry needs a ``source`` field pointing to the plugin
+    subdirectory relative to the marketplace root.
+
+    Structure:
+      plugins/pluck/                       ← marketplace root
+      ├── .claude-plugin/
+      │   └── marketplace.json             ← THIS file
+      └── <plugin>/                        ← plugin source = "./<plugin>"
+    """
+    marketplace_dir = claude_config_dir / "plugins" / MARKETPLACE_NAME
+    claude_plugin_dir = marketplace_dir / ".claude-plugin"
+    marketplace_file = claude_plugin_dir / "marketplace.json"
+
+    marketplace_dir.mkdir(parents=True, exist_ok=True)
+    claude_plugin_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean up old-style marketplace.json at wrong location (pre-2.1.x compat)
+    old_marketplace = marketplace_dir / "marketplace.json"
+    if old_marketplace.exists():
+        old_marketplace.unlink()
+
+    # Read existing marketplace.json if it exists
+    if marketplace_file.exists():
+        try:
+            with open(marketplace_file, encoding="utf-8") as f:
+                marketplace = cast(dict[str, Any], json.load(f))
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Corrupted marketplace.json, starting fresh")
+            marketplace = _new_marketplace_template()
+    else:
+        marketplace = _new_marketplace_template()
+
+    # Check if this plugin is already in the marketplace list
+    plugin_exists = any(
+        p.get("name") == name for p in marketplace.get("plugins", [])
+    )
+
+    if not plugin_exists:
+        # Build plugin entry with correct source path
+        plugin_manifest = install_dir / ".claude-plugin" / "plugin.json"
+        if plugin_manifest.exists():
+            with open(plugin_manifest, encoding="utf-8") as f:
+                plugin_data = cast(dict[str, Any], json.load(f))
+        else:
+            plugin_data = {"name": name}
+
+        # source is relative to the marketplace root (plugins/pluck/)
+        plugin_data["source"] = f"./{name}"
+
+        marketplace.setdefault("plugins", []).append(plugin_data)
+        _atomic_write_json(marketplace_file, marketplace)
+
+    # Register the marketplace in Claude's global settings so that
+    # /plugins can discover it. Claude stores local marketplace
+    # registrations in ~/.claude/settings.json under extraKnownMarketplaces.
+    _register_marketplace_with_claude(marketplace_dir)
+
+
+def _register_marketplace_with_claude(marketplace_dir: Path) -> None:
+    """Ensure the pluck marketplace is registered in Claude's settings.
+
+    Adds an entry to ``extraKnownMarketplaces`` in both the user's global
+    ``~/.claude/settings.json`` and the project-level config (when
+    ``CLAUDE_CONFIG_DIR`` is set) so that ``/plugins`` can discover it.
+
+    Tries the CLI first, falls back to direct JSON editing.
+    """
+    global_settings = Path.home() / ".claude" / "settings.json"
+
+    # --- Preferred path: use Claude's own CLI (idempotent) ---
+    try:
+        result = subprocess.run(
+            ["claude", "plugin", "marketplace", "add", str(marketplace_dir)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            logger.debug("Marketplace 'pluck' registered via CLI")
+            return
+        logger.debug("CLI registration failed: %s", result.stderr.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        logger.debug("Cannot invoke Claude CLI: %s", exc)
+
+    # --- Fallback: edit settings.json directly ---
+    # When CLAUDE_CONFIG_DIR is set, also write to project-level settings
+    settings_paths = [global_settings]
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        project_settings = Path(config_dir) / "settings.json"
+        if project_settings != global_settings:
+            settings_paths.append(project_settings)
+
+    entry = {
+        "source": {
+            "source": "directory",
+            "path": str(marketplace_dir),
+        }
     }
 
-    with open(manifest_dir / "marketplace.json", "w", encoding="utf-8") as f:
-        json.dump(marketplace, f, indent=2, ensure_ascii=False)
+    for settings_path in settings_paths:
+        if not settings_path.exists():
+            continue
+        data = _safe_load_json(settings_path)
+        marketplaces = data.setdefault("extraKnownMarketplaces", {})
+
+        if MARKETPLACE_NAME not in marketplaces:
+            marketplaces[MARKETPLACE_NAME] = entry
+            _atomic_write_json(settings_path, data)
+            logger.info(
+                "Marketplace 'pluck' registered in %s", settings_path
+            )
+
+
+def _new_marketplace_template() -> dict[str, Any]:
+    """Return a fresh marketplace manifest template."""
+    return {
+        "name": MARKETPLACE_NAME,
+        "description": "Pluck-managed plugins",
+        "owner": {"name": "pluck"},
+        "plugins": [],
+    }
 
 
 def _read_original_manifest(repo_dir: Path) -> dict[str, Any]:
@@ -283,6 +425,7 @@ def _get_repo_sha(repo_dir: Path) -> str:
     try:
         return get_commit_sha(repo_dir)
     except RuntimeError:
+        logger.warning("Could not determine git SHA for %s", repo_dir)
         return "unknown"
 
 
@@ -335,7 +478,10 @@ def _update_installed_plugins(
 def _update_settings(settings_file: Path, plugin_key: str) -> None:
     """Update settings.json to enable the plugin."""
     if not settings_file.exists():
-        logger.warning("settings.json not found at %s", settings_file)
+        # Create minimal settings.json if it doesn't exist
+        data = {"enabledPlugins": {plugin_key: True}}
+        _atomic_write_json(settings_file, data)
+        logger.info("Created settings.json with %s enabled", plugin_key)
         return
 
     data = _safe_load_json(settings_file)
@@ -347,12 +493,33 @@ def _update_settings(settings_file: Path, plugin_key: str) -> None:
     _atomic_write_json(settings_file, data)
 
 
-def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
-    """Uninstall a pluck-managed plugin by name."""
-    claude_config_dir = claude_config_dir or get_claude_config_dir()
-    plugin_key = f"{name}@{MARKETPLACE_NAME}"
+def _find_key_case_insensitive(
+    mapping: dict[str, Any], name_lower: str, marketplace: str
+) -> str | None:
+    """Find a key like ``<name>@<marketplace>`` with case-insensitive name match.
 
-    install_dir = get_install_dir(name, claude_config_dir).parent
+    Returns the actual key (preserving original case), or ``None``.
+    """
+    suffix = f"@{marketplace}"
+    for key in mapping:
+        if key.lower() == f"{name_lower}{suffix}":
+            return key
+    return None
+
+
+def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
+    """Uninstall a pluck-managed plugin by name.
+
+    Matching is case-insensitive — ``pluck uninstall ecc`` and
+    ``pluck uninstall ECC`` both match a plugin registered as ``ECC@pluck``.
+    """
+    claude_config_dir = claude_config_dir or get_claude_config_dir()
+    name_lower = validate_plugin_name(name)
+
+    plugins_base = (claude_config_dir / "plugins" / MARKETPLACE_NAME).resolve()
+    install_dir = _ensure_path_within_base(
+        get_install_dir(name_lower, claude_config_dir), plugins_base
+    )
     if install_dir.exists():
         shutil.rmtree(install_dir)
         logger.info("Removed plugin directory: %s", install_dir)
@@ -360,20 +527,85 @@ def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
     plugins_file = claude_config_dir / "plugins" / "installed_plugins.json"
     if plugins_file.exists():
         data = _safe_load_json(plugins_file)
-        if plugin_key in data.get("plugins", {}):
-            del data["plugins"][plugin_key]
+        # Case-insensitive key lookup
+        actual_key = _find_key_case_insensitive(
+            data.get("plugins", {}), name_lower, MARKETPLACE_NAME
+        )
+        if actual_key:
+            del data["plugins"][actual_key]
             _atomic_write_json(plugins_file, data)
-            logger.info("Removed from registry: %s", plugin_key)
+            logger.info("Removed from registry: %s", actual_key)
 
     settings_file = claude_config_dir / "settings.json"
     if settings_file.exists():
         data = _safe_load_json(settings_file)
-        if plugin_key in data.get("enabledPlugins", {}):
-            del data["enabledPlugins"][plugin_key]
+        actual_key = _find_key_case_insensitive(
+            data.get("enabledPlugins", {}), name_lower, MARKETPLACE_NAME
+        )
+        if actual_key:
+            del data["enabledPlugins"][actual_key]
             _atomic_write_json(settings_file, data)
-            logger.info("Removed from settings: %s", plugin_key)
+            logger.info("Removed from settings: %s", actual_key)
+
+    # Remove from marketplace manifest
+    marketplace_file = (
+        claude_config_dir / "plugins" / MARKETPLACE_NAME
+        / ".claude-plugin" / "marketplace.json"
+    )
+    if marketplace_file.exists():
+        mkt = _safe_load_json(marketplace_file)
+        mkt["plugins"] = [
+            p for p in mkt.get("plugins", [])
+            if p.get("name", "").lower() != name_lower
+        ]
+        _atomic_write_json(marketplace_file, mkt)
+        logger.info("Removed from marketplace: %s", name)
+
+    # Remove from pluck.yaml config
+    _remove_from_config(name_lower, claude_config_dir)
 
     return True
+
+
+def _remove_from_config(name_lower: str, claude_config_dir: Path) -> None:
+    """Remove a plugin entry from pluck.yaml (case-insensitive)."""
+    config_path = claude_config_dir / CONFIG_FILE_NAME
+    if not config_path.exists():
+        return
+
+    try:
+        import yaml
+
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    except Exception as exc:
+        logger.debug("Could not read config for uninstall cleanup: %s", exc)
+        return
+
+    if not config or "plugins" not in config:
+        return
+
+    plugins = config["plugins"]
+    original_len = len(plugins)
+    config["plugins"] = [
+        p for p in plugins if p.get("name", "").lower() != name_lower
+    ]
+
+    if len(config["plugins"]) < original_len:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".tmp", prefix=".pluck_cfg_", dir=str(config_path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    config, f, default_flow_style=False, allow_unicode=True
+                )
+            os.replace(tmp_path, config_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+        logger.info("Removed from config: %s", name_lower)
 
 
 def get_installed_plugins(

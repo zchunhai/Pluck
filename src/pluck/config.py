@@ -1,6 +1,7 @@
 """Config parsing and centralized path management for pluck."""
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,17 +17,59 @@ MARKETPLACE_NAME = "pluck"
 
 COMPONENT_TYPES = ("skills", "agents", "commands", "rules", "hooks", "contexts")
 
+# Max plugin name length (filesystem NAME_MAX safety margin)
+MAX_PLUGIN_NAME_LENGTH = 100
+
+# Safe name pattern: alphanumeric + limited special chars, no path separators
+_VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9][-._a-zA-Z0-9]*$")
+
+
+def validate_plugin_name(name: str) -> str:
+    """Validate and normalize a plugin name.  Raises ``ValueError`` on
+    invalid input (path separators, control chars, excessive length)."""
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Plugin name must be a non-empty string, got: {name!r}")
+    if len(name) > MAX_PLUGIN_NAME_LENGTH:
+        raise ValueError(
+            f"Plugin name too long ({len(name)} > {MAX_PLUGIN_NAME_LENGTH}): {name!r}"
+        )
+    if not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid plugin name {name!r} — "
+            f"must start with alphanumeric and contain only "
+            f"letters, digits, '-', '_', or '.'"
+        )
+    return name.lower()
+
+
+def validate_component_name(name: str) -> str:
+    """Validate a component name.  Rejects path separators and control chars."""
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Component name must be a non-empty string, got: {name!r}")
+    if "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError(f"Component name contains path separators: {name!r}")
+    if name in (".", ".."):
+        raise ValueError(f"Component name is reserved: {name!r}")
+    return name
+
 
 def get_repos_dir(claude_config_dir: Path | None = None) -> Path:
-    """Get the directory where plugin repos are cloned."""
-    base = claude_config_dir or get_claude_config_dir()
-    return base / MARKETPLACE_NAME / "repos"
+    """Get the directory where plugin repos are cloned.
+
+    Uses a shared XDG cache location so that repos are not duplicated
+    across environments.
+    """
+    _ = claude_config_dir  # kept for backward-compatible signature
+    cache_root = os.environ.get(
+        "XDG_CACHE_HOME", str(Path.home() / ".cache")
+    )
+    return Path(cache_root) / MARKETPLACE_NAME / "repos"
 
 
 def get_install_dir(plugin_name: str, claude_config_dir: Path | None = None) -> Path:
     """Get the install directory for a specific pluck-managed plugin."""
     base = claude_config_dir or get_claude_config_dir()
-    return base / "plugins" / "cache" / MARKETPLACE_NAME / plugin_name / "selected"
+    return base / "plugins" / MARKETPLACE_NAME / plugin_name
 
 
 def get_claude_config_dir() -> Path:
@@ -99,6 +142,7 @@ def validate_plugin(plugin: dict[str, Any], index: int) -> dict[str, Any]:
     name = plugin.get("name")
     if not name:
         raise ValueError(f"Plugin #{index} missing 'name'")
+    name = validate_plugin_name(name)
 
     repo = plugin.get("repo")
     if not repo:
@@ -129,7 +173,7 @@ def _normalize_selection(value: Any) -> list[str] | str:
     if isinstance(value, str):
         if value == "all":
             return "all"
-        return [value]
+        return [validate_component_name(value)]
     if isinstance(value, list):
-        return value
+        return [validate_component_name(v) for v in value]
     raise ValueError(f"Invalid component selection: {value!r}")
