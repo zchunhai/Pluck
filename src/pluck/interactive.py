@@ -1,6 +1,7 @@
 """Interactive component selection and config saving for pluck."""
 
 import logging
+import os
 import sys
 import termios
 import tty
@@ -17,19 +18,30 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ── Terminal raw-mode helpers ──────────────────────────────────────────
+# ── TTY detection ──
+
+
+def _is_tty() -> bool:
+    """Check if stdin is a real terminal (not piped)."""
+    return os.isatty(sys.stdin.fileno())
+
+
+# ── Terminal raw-mode ──────────────────────────────────────────────────
 
 
 def _read_key() -> str:
-    """Read a single keypress including arrow-key escape sequences."""
+    """Read a single keypress including arrow-key escape sequences.
+
+    Returns "\\x03" for Ctrl+C so callers can detect abort intent.
+    """
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
+        if ch == "\x03":
+            return "\x03"  # Ctrl+C
         if ch == "\x1b":
-            # Might be an escape sequence; try to read more
-            # Set non-blocking read for the next bytes
             new = list(old)
             new[4] = 0  # VMIN = 0 (poll)
             new[5] = 1  # VTIME = 0.1s
@@ -39,28 +51,26 @@ def _read_key() -> str:
                 ch3 = sys.stdin.read(1)
                 if ch3 in ("A", "B", "C", "D"):
                     return f"\x1b[{ch3}"
-                return ch3  # e.g. '3' from '\x1b[3~' (Delete)
-            return ch2 or ch  # standalone Escape or timed out
+                return ch3
+            return ch2 or ch
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-# ── ANSI helpers ───────────────────────────────────────────────────────
+# ── ANSI codes ─────────────────────────────────────────────────────────
 
-CLEAR_LINE = "\033[2K"
+CLEAR_BELOW = "\033[J"
 HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
+SAVE_CURSOR = "\033[s"
+RESTORE_CURSOR = "\033[u"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 GREEN = "\033[32m"
 CYAN = "\033[36m"
-
-
-def _move_cursor_up(n: int) -> None:
-    sys.stdout.write(f"\033[{n}A")
-    sys.stdout.flush()
+YELLOW = "\033[33m"
 
 
 # ── Interactive selection ──────────────────────────────────────────────
@@ -74,8 +84,8 @@ def interactive_select(
     """Run interactive component selection for a single plugin.
 
     Space to toggle, Enter to confirm. Up/Down or j/k to move cursor.
-    / to filter, a for all, n for none, q to reset category,
-    Q or Ctrl+C to abort everything.
+    / to start inline filter, type to filter in real-time.
+    q to reset category, Q or Ctrl+C to abort everything.
 
     Returns:
         Updated component selections dict, or None if user aborted.
@@ -103,7 +113,7 @@ def interactive_select(
         current = current_components.get(comp_type, [])
         current_names = _resolve_current_names(current, items)
 
-        selected = _select_category_tui(comp_type, items, current_names)
+        selected = _select_category(comp_type, items, current_names)
         if selected is None:
             return None  # user aborted
         result[comp_type] = selected
@@ -120,7 +130,7 @@ def _resolve_current_names(current: list[str] | str, all_items: list[str]) -> se
     return set()
 
 
-def _select_category_tui(
+def _select_category(
     comp_type: str,
     items: list[str],
     current_names: set[str],
@@ -130,43 +140,76 @@ def _select_category_tui(
     Returns list of selected names, "all", or None if aborted.
     """
     cursor = 0
-    display_items = list(items)
     filter_keyword = ""
+    filter_mode = False  # True while user is typing a filter
     selected = set(current_names)
 
     term_height = _term_height()
+    max_show = max(4, term_height - 5)  # 1 header + 1 filter + items + 1 help
 
-    print(HIDE_CURSOR, end="")
+    sys.stdout.write(SAVE_CURSOR)
+    sys.stdout.write(HIDE_CURSOR)
     sys.stdout.flush()
 
     try:
         while True:
-            max_show = max(4, term_height - 4)
+            display_items = _apply_filter(items, filter_keyword)
+            # Clamp cursor if filter changed
+            if cursor >= len(display_items) and display_items:
+                cursor = len(display_items) - 1
+            elif not display_items:
+                cursor = 0
+
             _render_frame(
-                comp_type, display_items, selected, cursor, filter_keyword, max_show
+                comp_type,
+                display_items,
+                selected,
+                cursor,
+                filter_keyword,
+                filter_mode,
+                max_show,
             )
 
             key = _read_key()
 
             if key == "\x03":
-                # Ctrl+C — abort everything
-                _cleanup_frame(len(display_items) + 3)
-                print("\n  ⚠ Aborted.")
+                sys.stdout.write(RESTORE_CURSOR)
+                sys.stdout.write(CLEAR_BELOW)
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                print("  ⚠ Aborted.")
                 return None
 
+            if filter_mode:
+                # In filter mode: keys modify the filter string
+                if key in ("\r", "\n", "\x1b"):
+                    filter_mode = False
+                elif key in ("\x7f", "\x08"):
+                    # Backspace / Delete
+                    filter_keyword = filter_keyword[:-1]
+                elif len(key) == 1 and key.isprintable():
+                    filter_keyword += key
+                continue
+
+            # Normal mode
             if key in ("\r", "\n"):
                 break  # Enter — confirm
 
             if key == "Q":
-                # Shift+Q — abort everything
-                _cleanup_frame(len(display_items) + 3)
-                print("\n  ⚠ Aborted.")
+                sys.stdout.write(RESTORE_CURSOR)
+                sys.stdout.write(CLEAR_BELOW)
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                print("  ⚠ Aborted.")
                 return None
 
             if key == "q":
-                # q — reset this category to previous selection
                 selected = set(current_names)
                 break
+
+            if key == "/":
+                filter_mode = True
+                continue
 
             if key in ("\x1b[A", "k"):
                 if display_items:
@@ -192,18 +235,13 @@ def _select_category_tui(
                 for name in display_items:
                     selected.discard(name)
 
-            elif key == "/":
-                _cleanup_frame(len(display_items) + 3)
-                new_kw = _read_filter_input(comp_type, filter_keyword)
-                filter_keyword = new_kw
-                display_items = _apply_filter(items, filter_keyword)
-                cursor = 0
-
             elif key == "\x1b":
                 break  # Escape — keep current
 
     finally:
-        print(SHOW_CURSOR, end="")
+        sys.stdout.write(RESTORE_CURSOR)
+        sys.stdout.write(CLEAR_BELOW)
+        sys.stdout.write(SHOW_CURSOR)
         sys.stdout.flush()
 
     if selected == set(items):
@@ -226,21 +264,8 @@ def _apply_filter(items: list[str], keyword: str) -> list[str]:
     """Filter items by keyword substring (case-insensitive)."""
     if not keyword:
         return list(items)
-    return [it for it in items if keyword.lower() in it.lower()]
-
-
-def _read_filter_input(comp_type: str, current: str) -> str:
-    """Read a filter keyword from the user (line-mode, not raw)."""
-    prompt = f"  filter {comp_type} [{current or 'none'}]> "
-    sys.stdout.write(SHOW_CURSOR)
-    sys.stdout.flush()
-    try:
-        val = input(prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        val = ""
-    sys.stdout.write(HIDE_CURSOR)
-    sys.stdout.flush()
-    return val
+    kw = keyword.lower()
+    return [it for it in items if kw in it.lower()]
 
 
 def _render_frame(
@@ -249,71 +274,76 @@ def _render_frame(
     selected: set[str],
     cursor: int,
     filter_keyword: str,
+    filter_mode: bool,
     max_show: int,
 ) -> None:
-    """Render the selection list with cursor and checkboxes."""
+    """Render the selection list with cursor and checkboxes.
+
+    Uses cursor save/restore to avoid line-wrapping flicker artifacts.
+    """
+    sys.stdout.write(RESTORE_CURSOR)
+    sys.stdout.write(CLEAR_BELOW)
+
     lines: list[str] = []
 
-    # Header
-    header = f"── {comp_type} ({len(selected)}/{len(items)} selected)"
-    if filter_keyword:
-        header += f"  filter: '{filter_keyword}'"
-    lines.append(f"{CYAN}{header}{RESET}")
+    # ── Filter bar (always visible at top) ──
+    if filter_mode:
+        bar = f"{YELLOW}filter:{RESET} {filter_keyword}{BOLD}█{RESET}"
+    elif filter_keyword:
+        bar = f"{DIM}filter: {filter_keyword}  [/] to edit{RESET}"
+    else:
+        bar = f"{DIM}[/] filter{RESET}"
+    lines.append(f"  {bar}")
 
-    # Determine scroll window
+    # ── Category header ──
+    header = f"{CYAN}── {comp_type}{RESET}  ({GREEN}{len(selected)}{RESET}/{len(items)} selected)"
+    lines.append(header)
+
+    # ── Items ──
     total = len(items)
-    if total <= max_show:
+    if total == 0:
+        lines.append(f"  {DIM}(no matches){RESET}")
+    elif total <= max_show:
         start, end = 0, total
     else:
-        # Keep cursor in view
         half = max_show // 2
         start = max(0, cursor - half)
         end = min(total, start + max_show)
         if end - start < max_show:
             start = max(0, end - max_show)
 
-    # Items
-    for i in range(start, end):
+    for i in range(start, end) if total > 0 else []:
         name = items[i]
         is_sel = name in selected
         is_cur = i == cursor
-
         checkbox = f"{GREEN}✓{RESET}" if is_sel else " "
-        prefix = f"{BOLD}>{RESET}" if is_cur else " "
+        pointer = f"{BOLD}>{RESET}" if is_cur else " "
 
         if is_cur:
-            line = f" {prefix} [{checkbox}] {BOLD}{name}{RESET}"
+            line = f" {pointer} [{checkbox}] {BOLD}{name}{RESET}"
         elif is_sel:
-            line = f" {prefix} [{checkbox}] {GREEN}{name}{RESET}"
+            line = f" {pointer} [{checkbox}] {GREEN}{name}{RESET}"
         else:
-            line = f" {prefix} [{checkbox}] {DIM}{name}{RESET}"
+            line = f" {pointer} [{checkbox}] {DIM}{name}{RESET}"
         lines.append(line)
 
-    # Trim indicator
-    if start > 0:
-        lines.insert(1, f"  {DIM}... {start} more above{RESET}")
-    if end < total:
-        lines.append(f"  {DIM}... {total - end} more below{RESET}")
+    if total > 0:
+        if start > 0:
+            lines.insert(2, f"  {DIM}... {start} more above{RESET}")
+        if end < total:
+            lines.append(f"  {DIM}... {total - end} more below{RESET}")
 
-    # Help line
-    lines.append(
-        f"\n{DIM}  [space] toggle  [↑↓/jk] move  [a] all  [n] none  [/] filter  [enter] confirm  [q] quit{RESET}"
-    )
+    # ── Help ──
+    if filter_mode:
+        help_line = f"{YELLOW}  [type to filter] [enter/esc] done{RESET}"
+    else:
+        help_line = (
+            f"{DIM}  [space] toggle  [↑↓/jk] move  [a] all  [n] none  "
+            f"[/] filter  [enter] confirm  [q] reset  [Q] abort{RESET}"
+        )
+    lines.append(help_line)
 
-    # Write all lines
     sys.stdout.write("\n".join(lines))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-
-    # Move cursor back up so next render overwrites this frame
-    _move_cursor_up(len(lines))
-
-
-def _cleanup_frame(lines: int) -> None:
-    """Clear the rendered frame lines so input() doesn't overlap."""
-    _move_cursor_up(1)
-    for _ in range(lines):
-        sys.stdout.write(CLEAR_LINE + "\r\n")
     sys.stdout.flush()
 
 
