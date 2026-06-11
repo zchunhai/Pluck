@@ -1,0 +1,58 @@
+# pluck.yaml - Configuration for selective Claude plugin installation
+#
+# Each plugin entry specifies:
+#   name:       Plugin identifier (used for command prefix, e.g. "ecc:react-patterns")
+#   repo:       GitHub repository URL
+#   branch:     Git branch to use (default: main)
+#   components: Which components to install
+#
+# Component types:
+#   skills:   List of skill names, "all", or omitted/false
+#   agents:   List of agent names
+#   commands: List of command names
+#   rules:    List of rule categories
+#   hooks:    true (install all hooks) or false/omitted
+#   contexts: List of context names
+#
+# Use "pluck list" to see all available components in a cloned repo.
+
+plugins:
+  # Example: Install selected skills from superpowers
+  - name: superpowers
+    repo: https://github.com/obra/superpowers.git
+    branch: main
+    components:
+      skills:
+        - brainstorming
+        - writing-plans
+        - test-driven-development
+        - systematic-debugging
+        - verification-before-completion
+      # No agents, commands, rules, or hooks from superpowers
+
+  # Example: Install selected components from ecc
+  - name: ecc
+    repo: https://github.com/affaan-m/ECC.git
+    branch: main
+    components:
+      skills:
+        - react-patterns
+        - python-patterns
+        - golang-patterns
+        - tdd-workflow
+        - deep-research
+        - error-handling
+        - e2e-testing
+      agents:
+        - code-reviewer
+        - architect
+        - security-reviewer
+        - tdd-guide
+      commands:
+        - code-review
+        - build-fix
+        - security-scan
+        - evolve
+      rules:
+        - common
+      # hooks: true  # Uncomment to install ecc hooks (includes scripts)
