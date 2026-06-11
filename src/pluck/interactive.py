@@ -1,6 +1,9 @@
 """Interactive component selection and config saving for pluck."""
 
 import logging
+import sys
+import termios
+import tty
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,54 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ── Terminal raw-mode helpers ──────────────────────────────────────────
+
+
+def _read_key() -> str:
+    """Read a single keypress including arrow-key escape sequences."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            # Might be an escape sequence; try to read more
+            # Set non-blocking read for the next bytes
+            new = list(old)
+            new[4] = 0  # VMIN = 0 (poll)
+            new[5] = 1  # VTIME = 0.1s
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+            ch2 = sys.stdin.read(1)
+            if ch2 == "[":
+                ch3 = sys.stdin.read(1)
+                if ch3 in ("A", "B", "C", "D"):
+                    return f"\x1b[{ch3}"
+                return ch3  # e.g. '3' from '\x1b[3~' (Delete)
+            return ch2 or ch  # standalone Escape or timed out
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# ── ANSI helpers ───────────────────────────────────────────────────────
+
+CLEAR_LINE = "\033[2K"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+
+
+def _move_cursor_up(n: int) -> None:
+    sys.stdout.write(f"\033[{n}A")
+    sys.stdout.flush()
+
+
+# ── Interactive selection ──────────────────────────────────────────────
+
 
 def interactive_select(
     plugin_name: str,
@@ -21,6 +72,9 @@ def interactive_select(
     current_components: dict[str, Any],
 ) -> dict[str, Any]:
     """Run interactive component selection for a single plugin.
+
+    Space to toggle, Enter to confirm. Up/Down or j/k to move cursor.
+    / to filter, a for all, n for none.
 
     Args:
         plugin_name: Plugin name for display.
@@ -35,9 +89,11 @@ def interactive_select(
     total_counts = " | ".join(
         f"{len(items)} {t}" for t, items in available.items() if items
     )
-    print(f"\n📦 {plugin_name} ({total_counts})")
-    print("  Enter: numbers/ranges (1 3 5-10), 'all', 'none', '/keyword' to filter")
-    print("  Press Enter to keep current selection and continue\n")
+    print(f"\n{BOLD}📦 {plugin_name}{RESET} ({total_counts})")
+    print(
+        f"  {DIM}[space] toggle  [enter] confirm  [a] all  [n] none  [/] filter  [q] quit{RESET}"
+    )
+    print()
 
     result: dict[str, Any] = {}
 
@@ -50,7 +106,7 @@ def interactive_select(
         current = current_components.get(comp_type, [])
         current_names = _resolve_current_names(current, items)
 
-        selected = _select_category(comp_type, items, current_names)
+        selected = _select_category_tui(comp_type, items, current_names)
         result[comp_type] = selected
 
     return result
@@ -65,104 +121,202 @@ def _resolve_current_names(current: list[str] | str, all_items: list[str]) -> se
     return set()
 
 
-def _select_category(
-    comp_type: str, items: list[str], current_names: set[str]
+def _select_category_tui(
+    comp_type: str,
+    items: list[str],
+    current_names: set[str],
 ) -> list[str] | str:
-    """Interactive selection for one component category."""
-    filtered_items = list(items)
-    filter_keyword = ""
+    """Terminal-UI selection for one component category.
 
-    while True:
-        selected = {name for name in filtered_items if name in current_names}
-        _print_items(filtered_items, selected, filter_keyword)
-
-        count_text = (
-            f"{len(current_names)} selected"
-            if len(current_names) <= len(items)
-            else "all selected"
-        )
-        prompt = f"  {comp_type} ({count_text})> "
-        answer = input(prompt).strip()
-
-        if not answer:
-            break
-
-        if answer == "all":
-            current_names = set(items)
-            continue
-
-        if answer == "none":
-            current_names = set()
-            continue
-
-        if answer.startswith("/"):
-            filter_keyword = answer[1:].strip().lower()
-            if filter_keyword:
-                filtered_items = [it for it in items if filter_keyword in it.lower()]
-            else:
-                filtered_items = list(items)
-                filter_keyword = ""
-            continue
-
-        indices = _parse_numbers(answer, len(filtered_items))
-        if indices is not None:
-            for idx in indices:
-                name = filtered_items[idx - 1]
-                if name in current_names:
-                    current_names.discard(name)
-                else:
-                    current_names.add(name)
-            continue
-
-        print("  ⚠ Invalid input. Use numbers, 'all', 'none', or '/keyword'")
-
-    if current_names == set(items):
-        return "all"
-    return sorted(current_names)
-
-
-def _print_items(items: list[str], selected: set[str], filter_keyword: str) -> None:
-    """Print items with selection markers."""
-    header = f"\n── {len(items)} items"
-    if filter_keyword:
-        header += f" (filtered: '{filter_keyword}')"
-    print(header)
-
-    for i, name in enumerate(items, 1):
-        marker = "✓" if name in selected else " "
-        print(f"  [{marker}] {i:3d}. {name}")
-
-    print()
-
-
-def _parse_numbers(answer: str, max_count: int) -> list[int] | None:
-    """Parse number selections like '1 3 5-10'.
-
-    Returns list of 1-based indices, or None if invalid.
+    Returns list of selected names, or "all".
     """
-    indices: list[int] = []
-    for part in answer.replace(",", " ").split():
-        if "-" in part:
-            parts = part.split("-", 1)
-            try:
-                start, end = int(parts[0]), int(parts[1])
-            except ValueError:
-                return None
-            if start < 1 or end < start or end > max_count:
-                print(f"  ⚠ Range {part} out of bounds (1-{max_count})")
-                continue
-            indices.extend(range(start, end + 1))
-        else:
-            try:
-                n = int(part)
-            except ValueError:
-                return None
-            if n < 1 or n > max_count:
-                print(f"  ⚠ Number {n} out of bounds (1-{max_count})")
-                continue
-            indices.append(n)
+    cursor = 0  # index into display_items
+    display_items = list(items)
+    filter_keyword = ""
+    selected = set(current_names)
 
-    return indices if indices else None
+    # Pre-calculate available terminal height
+    term_height = _term_height()
+
+    print(HIDE_CURSOR, end="")
+    sys.stdout.flush()
+
+    try:
+        while True:
+            max_show = max(4, term_height - 4)
+            _render_frame(
+                comp_type, display_items, selected, cursor, filter_keyword, max_show
+            )
+
+            key = _read_key()
+
+            if key in ("\r", "\n"):
+                # Enter — confirm
+                break
+
+            elif key in ("q", "Q"):
+                # Quit without saving changes
+                selected = set(current_names)
+                break
+
+            elif key in ("\x1b[A", "k"):
+                # Up
+                if display_items:
+                    cursor = (cursor - 1) % len(display_items)
+
+            elif key in ("\x1b[B", "j"):
+                # Down
+                if display_items:
+                    cursor = (cursor + 1) % len(display_items)
+
+            elif key == " ":
+                # Space — toggle
+                if display_items:
+                    name = display_items[cursor]
+                    if name in selected:
+                        selected.discard(name)
+                    else:
+                        selected.add(name)
+
+            elif key in ("a", "A"):
+                # Select all visible
+                for name in display_items:
+                    selected.add(name)
+
+            elif key in ("n", "N"):
+                # Deselect all visible
+                for name in display_items:
+                    selected.discard(name)
+
+            elif key == "/":
+                # Enter filter mode
+                _cleanup_frame(len(display_items) + 3)
+                new_kw = _read_filter_input(comp_type, filter_keyword)
+                filter_keyword = new_kw
+                display_items = _apply_filter(items, filter_keyword)
+                cursor = 0
+
+            elif key == "\x1b":
+                # Escape — keep current
+                break
+
+    finally:
+        print(SHOW_CURSOR, end="")
+        sys.stdout.flush()
+
+    # Determine return value
+    if selected == set(items):
+        return "all"
+    return sorted(selected)
+
+
+def _term_height() -> int:
+    """Get terminal height, defaulting to 24."""
+    try:
+        import shutil
+
+        size = shutil.get_terminal_size()
+        return size.lines
+    except Exception:
+        return 24
+
+
+def _apply_filter(items: list[str], keyword: str) -> list[str]:
+    """Filter items by keyword substring (case-insensitive)."""
+    if not keyword:
+        return list(items)
+    return [it for it in items if keyword.lower() in it.lower()]
+
+
+def _read_filter_input(comp_type: str, current: str) -> str:
+    """Read a filter keyword from the user (line-mode, not raw)."""
+    prompt = f"  filter {comp_type} [{current or 'none'}]> "
+    sys.stdout.write(SHOW_CURSOR)
+    sys.stdout.flush()
+    try:
+        val = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        val = ""
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+    return val
+
+
+def _render_frame(
+    comp_type: str,
+    items: list[str],
+    selected: set[str],
+    cursor: int,
+    filter_keyword: str,
+    max_show: int,
+) -> None:
+    """Render the selection list with cursor and checkboxes."""
+    lines: list[str] = []
+
+    # Header
+    header = f"── {comp_type} ({len(selected)}/{len(items)} selected)"
+    if filter_keyword:
+        header += f"  filter: '{filter_keyword}'"
+    lines.append(f"{CYAN}{header}{RESET}")
+
+    # Determine scroll window
+    total = len(items)
+    if total <= max_show:
+        start, end = 0, total
+    else:
+        # Keep cursor in view
+        half = max_show // 2
+        start = max(0, cursor - half)
+        end = min(total, start + max_show)
+        if end - start < max_show:
+            start = max(0, end - max_show)
+
+    # Items
+    for i in range(start, end):
+        name = items[i]
+        is_sel = name in selected
+        is_cur = i == cursor
+
+        checkbox = f"{GREEN}✓{RESET}" if is_sel else " "
+        prefix = f"{BOLD}>{RESET}" if is_cur else " "
+
+        if is_cur:
+            line = f" {prefix} [{checkbox}] {BOLD}{name}{RESET}"
+        elif is_sel:
+            line = f" {prefix} [{checkbox}] {GREEN}{name}{RESET}"
+        else:
+            line = f" {prefix} [{checkbox}] {DIM}{name}{RESET}"
+        lines.append(line)
+
+    # Trim indicator
+    if start > 0:
+        lines.insert(1, f"  {DIM}... {start} more above{RESET}")
+    if end < total:
+        lines.append(f"  {DIM}... {total - end} more below{RESET}")
+
+    # Help line
+    lines.append(
+        f"\n{DIM}  [space] toggle  [↑↓/jk] move  [a] all  [n] none  [/] filter  [enter] confirm  [q] quit{RESET}"
+    )
+
+    # Write all lines
+    sys.stdout.write("\n".join(lines))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    # Move cursor back up so next render overwrites this frame
+    _move_cursor_up(len(lines))
+
+
+def _cleanup_frame(lines: int) -> None:
+    """Clear the rendered frame lines so input() doesn't overlap."""
+    _move_cursor_up(1)
+    for _ in range(lines):
+        sys.stdout.write(CLEAR_LINE + "\r\n")
+    sys.stdout.flush()
+
+
+# ── Config saving ──────────────────────────────────────────────────────
 
 
 def save_config(config_path: Path, plugins: list[dict[str, Any]]) -> None:
