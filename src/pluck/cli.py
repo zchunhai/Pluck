@@ -18,6 +18,7 @@ from typing import Any, cast
 from pluck.config import (
     COMPONENT_TYPES,
     get_claude_config_dir,
+    get_default_config_path,
     get_install_dir,
     get_repos_dir,
     load_config,
@@ -40,12 +41,7 @@ def main() -> None:
         prog="pluck",
         description="Selective Claude plugin installer",
     )
-    parser.add_argument(
-        "-c",
-        "--config",
-        default=None,
-        help="Config file path (default: $CLAUDE_CONFIG_DIR/pluck.yaml)",
-    )
+
     parser.add_argument(
         "-v",
         "--verbose",
@@ -154,10 +150,10 @@ def _extract_plugin_name(repo_url: str) -> str:
 def _ensure_repo_in_config(args: argparse.Namespace) -> None:
     """Add a plugin from --repo URL to config file if not already present."""
     name = args.plugin or _extract_plugin_name(args.repo)
-    config_path = Path(args.config)
+    config_path = get_default_config_path()
 
     try:
-        config = load_config(config_path)
+        config = load_config()
     except FileNotFoundError:
         config = {"plugins": []}
 
@@ -194,7 +190,7 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
     if args.repo:
         _ensure_repo_in_config(args)
 
-    config = load_config(args.config)
+    config = load_config()
     repos_dir = get_repos_dir(claude_dir)
 
     for plugin in _filter_plugins(config, args.plugin):
@@ -217,7 +213,7 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
 
 def cmd_update(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'update' command."""
-    config = load_config(args.config)
+    config = load_config()
     repos_dir = get_repos_dir(claude_dir)
 
     for plugin in _filter_plugins(config, args.plugin):
@@ -254,7 +250,7 @@ def cmd_uninstall(args: argparse.Namespace, claude_dir: Path) -> None:
 
 def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'select' command - interactive component selection."""
-    config = load_config(args.config)
+    config = load_config()
     repos_dir = get_repos_dir(claude_dir)
     changed = False
 
@@ -281,7 +277,7 @@ def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
             logger.info("  No changes for '%s'", name)
 
     if changed:
-        save_interactive_config(Path(args.config), config["plugins"])
+        save_interactive_config(get_default_config_path(), config["plugins"])
         logger.info("")
 
         if args.install:
@@ -296,7 +292,7 @@ def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
 
 def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'list' command with three-state display."""
-    config = load_config(args.config)
+    config = load_config()
     repos_dir = get_repos_dir(claude_dir)
 
     for plugin in _filter_plugins(config, args.plugin):

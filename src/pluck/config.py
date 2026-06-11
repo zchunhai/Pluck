@@ -42,10 +42,9 @@ def get_default_config_path() -> Path:
     return get_claude_config_dir() / CONFIG_FILE_NAME
 
 
-def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
-    """Load and validate pluck configuration file."""
-    if config_path is None:
-        config_path = get_default_config_path()
+def load_config() -> dict[str, Any]:
+    """Load and validate pluck configuration file from $CLAUDE_CONFIG_DIR/pluck.yaml."""
+    config_path = get_default_config_path()
 
     config_path = Path(config_path)
     if not config_path.exists():
