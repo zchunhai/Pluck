@@ -17,17 +17,17 @@ Usage::
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
+import shlex
 import shutil
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from pluck.config import validate_plugin_name
+from pluck.io_utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -88,36 +88,9 @@ def _load_registry() -> list[EnvironmentEntry]:
 
 
 def _save_registry(environments: list[EnvironmentEntry]) -> None:
-    """Atomically write the environment registry to disk.
-
-    Reuses the same atomic-write-with-backup pattern as
-    ``installer._atomic_write_json``.
-    """
-    registry_path = ENV_REGISTRY_PATH
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-
+    """Atomically write the environment registry to disk."""
     data: dict[str, Any] = {"version": 1, "environments": environments}
-
-    # Backup existing file
-    if registry_path.exists():
-        backup = registry_path.with_suffix(".json.bak")
-        shutil.copy2(registry_path, backup)
-
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".tmp", prefix=".pluck_envreg_", dir=str(registry_path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, registry_path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    finally:
-        if os.path.exists(tmp_path):
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
+    atomic_write_json(ENV_REGISTRY_PATH, data)
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +276,14 @@ def get_env_path(name: str) -> Path | None:
     return None
 
 
+DEFAULT_ENV_NAME = "default"
+DEFAULT_ENV_DIR = Path.home() / ".claude"
+
+
 def switch_env_command(name: str) -> str:
     """Generate the shell command to activate an environment.
+
+    Special name ``"default"`` switches back to ``~/.claude/`` (deactivates).
 
     The returned string is suitable for ``eval "$(pluck env switch <name>)"``::
 
@@ -315,27 +294,25 @@ def switch_env_command(name: str) -> str:
     ValueError
         If the named environment is not found.
     """
+    if name.lower() == DEFAULT_ENV_NAME:
+        default_dir = DEFAULT_ENV_DIR
+        return (
+            "unset CLAUDE_CONFIG_DIR;"
+            f' echo "🔌 Switched to default environment ({default_dir})"'
+        )
+
     env_path = get_env_path(name)
     if env_path is None:
-        raise ValueError(f"Environment not found: '{name}'")
+        raise ValueError(
+            f"Environment not found: '{name}'. "
+            f"Available: default, " +
+            ", ".join(e["name"] for e in _load_registry())
+        )
 
+    safe_path = shlex.quote(str(env_path))
     return (
-        f'export CLAUDE_CONFIG_DIR="{env_path}";'
+        f"export CLAUDE_CONFIG_DIR={safe_path};"
         f' echo "🔌 Activated environment: {name} ({env_path})"'
-    )
-
-
-def deactivate_command() -> str:
-    """Generate the shell command to deactivate the current environment.
-
-    The returned string is suitable for ``eval "$(pluck env deactivate)"``::
-
-        unset CLAUDE_CONFIG_DIR; echo "Deactivated ..."
-    """
-    default_dir = Path.home() / ".claude"
-    return (
-        f'unset CLAUDE_CONFIG_DIR;'
-        f' echo "🔌 Deactivated. Using default Claude config: {default_dir}"'
     )
 
 
@@ -366,7 +343,7 @@ pluck() {
     case "$1" in
         env)
             case "$2" in
-                create|switch|deactivate)
+                create|switch)
                     eval "$(command pluck "$@")"
                     ;;
                 *)

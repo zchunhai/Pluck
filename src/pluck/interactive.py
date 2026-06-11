@@ -1,9 +1,6 @@
 """Config saving for pluck."""
 
-import contextlib
 import logging
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +8,8 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+from pluck.io_utils import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +56,12 @@ def save_config(config_path: Path, plugins: list[dict[str, Any]]) -> None:
     data = {**original, "plugins": updated_plugins}
 
     # Atomic write for consistency with JSON paths
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".tmp", prefix=".pluck_cfg_", dir=str(config_path.parent)
+    content = yaml.dump(
+        data,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.dump(
-                data,
-                f,
-                default_flow_style=False,
-                allow_unicode=True,
-                sort_keys=False,
-            )
-        os.replace(tmp_path, config_path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
+    atomic_write(config_path, content)
 
     logger.info("Config saved to %s", config_path)

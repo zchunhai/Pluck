@@ -1,12 +1,10 @@
 """Plugin creation, registration, and uninstall for pluck."""
 
-import contextlib
 import json
 import logging
 import os
 import shutil
 import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +16,7 @@ from pluck.config import (
     get_install_dir,
     validate_plugin_name,
 )
+from pluck.io_utils import atomic_write_json, safe_load_json
 from pluck.repo import discover_components, get_commit_sha, resolve_component_paths
 
 logger = logging.getLogger(__name__)
@@ -31,50 +30,6 @@ COMPONENT_DIR_MAP = {
     "hooks": "hooks",
     "contexts": "contexts",
 }
-
-
-def _atomic_write_json(path: Path, data: dict, indent: int = 2) -> None:
-    """Write JSON atomically: write to temp file, then os.replace.
-
-    Prevents corruption from concurrent writes and crash mid-write.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Backup existing file
-    if path.exists():
-        backup = path.with_suffix(".json.bak")
-        shutil.copy2(path, backup)
-
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".tmp", prefix=".pluck_", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=indent, ensure_ascii=False)
-        os.replace(tmp_path, path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    finally:
-        if os.path.exists(tmp_path):
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-
-
-def _safe_load_json(path: Path) -> dict[str, Any]:
-    """Load JSON file with fallback to backup on corruption."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return cast(dict[str, Any], json.load(f))
-    except json.JSONDecodeError:
-        backup = path.with_suffix(".json.bak")
-        if backup.exists():
-            logger.warning("Corrupted JSON: %s, restoring from backup", path)
-            with open(backup, encoding="utf-8") as f:
-                return cast(dict[str, Any], json.load(f))
-        raise
 
 
 def _ensure_path_within_base(target: Path, base: Path) -> Path:
@@ -277,7 +232,7 @@ def _create_marketplace_manifest(
         plugin_data["source"] = f"./{name}"
 
         marketplace.setdefault("plugins", []).append(plugin_data)
-        _atomic_write_json(marketplace_file, marketplace)
+        atomic_write_json(marketplace_file, marketplace)
 
     # Register the marketplace in Claude's global settings so that
     # /plugins can discover it. Claude stores local marketplace
@@ -330,12 +285,12 @@ def _register_marketplace_with_claude(marketplace_dir: Path) -> None:
     for settings_path in settings_paths:
         if not settings_path.exists():
             continue
-        data = _safe_load_json(settings_path)
+        data = safe_load_json(settings_path)
         marketplaces = data.setdefault("extraKnownMarketplaces", {})
 
         if MARKETPLACE_NAME not in marketplaces:
             marketplaces[MARKETPLACE_NAME] = entry
-            _atomic_write_json(settings_path, data)
+            atomic_write_json(settings_path, data)
             logger.info(
                 "Marketplace 'pluck' registered in %s", settings_path
             )
@@ -457,7 +412,7 @@ def _update_installed_plugins(
 ) -> None:
     """Update the installed_plugins.json registry."""
     if plugins_file.exists():
-        data = _safe_load_json(plugins_file)
+        data = safe_load_json(plugins_file)
     else:
         data = {"version": 2, "plugins": {}}
 
@@ -472,7 +427,7 @@ def _update_installed_plugins(
     }
 
     data["plugins"][plugin_key] = [entry]
-    _atomic_write_json(plugins_file, data)
+    atomic_write_json(plugins_file, data)
 
 
 def _update_settings(settings_file: Path, plugin_key: str) -> None:
@@ -480,17 +435,17 @@ def _update_settings(settings_file: Path, plugin_key: str) -> None:
     if not settings_file.exists():
         # Create minimal settings.json if it doesn't exist
         data = {"enabledPlugins": {plugin_key: True}}
-        _atomic_write_json(settings_file, data)
+        atomic_write_json(settings_file, data)
         logger.info("Created settings.json with %s enabled", plugin_key)
         return
 
-    data = _safe_load_json(settings_file)
+    data = safe_load_json(settings_file)
 
     if "enabledPlugins" not in data:
         data["enabledPlugins"] = {}
 
     data["enabledPlugins"][plugin_key] = True
-    _atomic_write_json(settings_file, data)
+    atomic_write_json(settings_file, data)
 
 
 def _find_key_case_insensitive(
@@ -526,25 +481,25 @@ def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
 
     plugins_file = claude_config_dir / "plugins" / "installed_plugins.json"
     if plugins_file.exists():
-        data = _safe_load_json(plugins_file)
+        data = safe_load_json(plugins_file)
         # Case-insensitive key lookup
         actual_key = _find_key_case_insensitive(
             data.get("plugins", {}), name_lower, MARKETPLACE_NAME
         )
         if actual_key:
             del data["plugins"][actual_key]
-            _atomic_write_json(plugins_file, data)
+            atomic_write_json(plugins_file, data)
             logger.info("Removed from registry: %s", actual_key)
 
     settings_file = claude_config_dir / "settings.json"
     if settings_file.exists():
-        data = _safe_load_json(settings_file)
+        data = safe_load_json(settings_file)
         actual_key = _find_key_case_insensitive(
             data.get("enabledPlugins", {}), name_lower, MARKETPLACE_NAME
         )
         if actual_key:
             del data["enabledPlugins"][actual_key]
-            _atomic_write_json(settings_file, data)
+            atomic_write_json(settings_file, data)
             logger.info("Removed from settings: %s", actual_key)
 
     # Remove from marketplace manifest
@@ -553,12 +508,12 @@ def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
         / ".claude-plugin" / "marketplace.json"
     )
     if marketplace_file.exists():
-        mkt = _safe_load_json(marketplace_file)
+        mkt = safe_load_json(marketplace_file)
         mkt["plugins"] = [
             p for p in mkt.get("plugins", [])
             if p.get("name", "").lower() != name_lower
         ]
-        _atomic_write_json(marketplace_file, mkt)
+        atomic_write_json(marketplace_file, mkt)
         logger.info("Removed from marketplace: %s", name)
 
     # Remove from pluck.yaml config
@@ -569,6 +524,8 @@ def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
 
 def _remove_from_config(name_lower: str, claude_config_dir: Path) -> None:
     """Remove a plugin entry from pluck.yaml (case-insensitive)."""
+    from pluck.io_utils import atomic_write
+
     config_path = claude_config_dir / CONFIG_FILE_NAME
     if not config_path.exists():
         return
@@ -592,19 +549,10 @@ def _remove_from_config(name_lower: str, claude_config_dir: Path) -> None:
     ]
 
     if len(config["plugins"]) < original_len:
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp", prefix=".pluck_cfg_", dir=str(config_path.parent)
+        content = yaml.safe_dump(
+            config, default_flow_style=False, allow_unicode=True
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                yaml.safe_dump(
-                    config, f, default_flow_style=False, allow_unicode=True
-                )
-            os.replace(tmp_path, config_path)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
+        atomic_write(config_path, content)
         logger.info("Removed from config: %s", name_lower)
 
 
@@ -618,7 +566,7 @@ def get_installed_plugins(
     if not plugins_file.exists():
         return {}
 
-    data = _safe_load_json(plugins_file)
+    data = safe_load_json(plugins_file)
 
     pluck_plugins: dict[str, Any] = {}
     for key, entries in data.get("plugins", {}).items():

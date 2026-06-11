@@ -78,15 +78,11 @@ def main() -> None:
     env_switch = env_sub.add_parser("switch", help="Activate an environment")
     env_switch.add_argument("name", help="Environment to switch to")
 
-    env_sub.add_parser("deactivate", help="Deactivate the current environment")
-
     env_init = env_sub.add_parser("init", help="Generate shell wrapper for auto-switching")
     env_init.add_argument(
         "--shell", choices=["zsh", "bash"], default="zsh",
         help="Target shell (default: zsh)",
     )
-
-    env_sub.add_parser("current", help="Show the currently active environment")
 
     env_delete = env_sub.add_parser("delete", help="Delete an environment")
     env_delete.add_argument("name", help="Environment to delete")
@@ -106,6 +102,11 @@ def main() -> None:
         help="With --repo: install all components",
     )
     install_p.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Non-interactive mode: skip component selection, use config as-is",
+    )
+    install_p.add_argument(
         "--dry-run", action="store_true", help="Preview without installing"
     )
 
@@ -117,13 +118,11 @@ def main() -> None:
     uninstall_p = subparsers.add_parser(
         "uninstall", help="Uninstall pluck-managed plugins"
     )
-    uninstall_p.add_argument("plugin_name", nargs="?", help="Plugin to uninstall")
-
-    # --- select ---
-    select_p = subparsers.add_parser("select", help="Interactively select components")
-    select_p.add_argument("-p", "--plugin", help="Select for a specific plugin only")
-    select_p.add_argument(
-        "--install", action="store_true", help="Install after selecting"
+    uninstall_p.add_argument("plugin_name", help="Plugin to uninstall")
+    uninstall_p.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompt"
     )
 
     # --- list ---
@@ -132,7 +131,7 @@ def main() -> None:
     list_p.add_argument(
         "-t",
         "--type",
-        choices=["skills", "agents", "commands", "rules", "hooks"],
+        choices=list(COMPONENT_TYPES),
         help="Filter by component type",
     )
 
@@ -158,7 +157,6 @@ def main() -> None:
             "install": lambda: cmd_install(args, claude_dir),
             "update": lambda: cmd_update(args, claude_dir),
             "uninstall": lambda: cmd_uninstall(args, claude_dir),
-            "select": lambda: cmd_select(args, claude_dir),
             "list": lambda: cmd_list(args, claude_dir),
             "status": lambda: cmd_status(args, claude_dir),
         }
@@ -170,6 +168,18 @@ def main() -> None:
 
             traceback.print_exc()
         sys.exit(1)
+
+
+def _validate_repo_url(url: str) -> str:
+    """Validate that a URL looks like a valid git repository URL."""
+    url = url.strip()
+    valid_prefixes = ("https://", "http://", "git://", "git@", "ssh://")
+    if not any(url.startswith(p) for p in valid_prefixes):
+        raise ValueError(
+            f"Invalid repo URL: {url!r}. "
+            f"Expected https://, git://, git@host:user/repo, or ssh:// format."
+        )
+    return url
 
 
 def _extract_plugin_name(repo_url: str) -> str:
@@ -189,6 +199,7 @@ def _extract_plugin_name(repo_url: str) -> str:
 
 def _ensure_repo_in_config(args: argparse.Namespace) -> None:
     """Add a plugin from --repo URL to config file if not already present."""
+    _validate_repo_url(args.repo)
     name = validate_plugin_name(
         args.plugin or _extract_plugin_name(args.repo)
     )
@@ -227,16 +238,21 @@ def _ensure_repo_in_config(args: argparse.Namespace) -> None:
 def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'install' command.
 
+    With no args: interactive selection for each configured plugin, then install.
     With --repo only (no --all): adds to config, runs interactive selection,
     then installs. With --repo --all: adds to config with all components,
-    then installs. Without --repo: installs plugins already in config.
+    then installs.
     """
+    config = load_config()
+
+    # Add from --repo URL
     if args.repo:
         _ensure_repo_in_config(args)
 
-    config = load_config()
     repos_dir = get_repos_dir(claude_dir)
+    changed = False
 
+    # Install phase
     for plugin in _filter_plugins(config, args.plugin):
         logger.info("📦 Processing: %s", plugin["name"])
 
@@ -248,16 +264,18 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
             logger.error("  Failed: %s", e)
             continue
 
-        # --repo without --all: interactive selection for the new plugin
+        # Interactive selection: default on, skip with --yes or --repo --all
         is_repo_plugin = args.repo and (
             plugin["name"] == _extract_plugin_name(args.repo)
             or (args.plugin and plugin["name"] == args.plugin)
         )
-        if is_repo_plugin and not args.install_all:
+        skip_interact = args.yes or (is_repo_plugin and args.install_all)
+
+        if not skip_interact:
             logger.info(
                 "  Interactive selection:\n"
                 "    [Tab] switch type  [Space] toggle  [a] all  [Enter] confirm\n"
-                "    (or use: pluck install --repo <URL> --all)"
+                "    (or use: pluck install -y for non-interactive)"
             )
             new_components = interactive_select(
                 plugin["name"], repo_dir, plugin["components"]
@@ -267,14 +285,21 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
                 continue
             if new_components != plugin["components"]:
                 plugin["components"] = new_components
-                save_interactive_config(get_default_config_path(), config["plugins"])
-                logger.info("  ✅ Selection saved for '%s'", plugin["name"])
+                changed = True
+                logger.info("  ✅ Selection updated for '%s'", plugin["name"])
+            else:
+                logger.info("  No changes for '%s'", plugin["name"])
 
         if args.dry_run:
             _show_dry_run(plugin, repo_dir)
         else:
             install_plugin(plugin, repo_dir, claude_dir)
             logger.info("  ✅ '%s' installed\n", plugin["name"])
+
+    # Save config if any selections changed
+    if changed:
+        save_interactive_config(get_default_config_path(), config["plugins"])
+        logger.info("✅ Selection saved.\n")
 
 
 def cmd_update(args: argparse.Namespace, claude_dir: Path) -> None:
@@ -299,65 +324,27 @@ def cmd_update(args: argparse.Namespace, claude_dir: Path) -> None:
 
 def cmd_uninstall(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'uninstall' command."""
-    if args.plugin_name:
-        logger.info("🗑️  Uninstalling: %s", args.plugin_name)
-        uninstall_plugin(args.plugin_name, claude_dir)
-        logger.info("  ✅ Done")
-    else:
-        installed = get_installed_plugins(claude_dir)
-        if not installed:
-            logger.info("No pluck-managed plugins to uninstall")
+    plugin_name = args.plugin_name
+
+    # Check if plugin is installed
+    installed = get_installed_plugins(claude_dir)
+    if plugin_name not in installed:
+        logger.error("Plugin '%s' is not installed", plugin_name)
+        logger.info("To see installed plugins, run: pluck status")
+        sys.exit(1)
+
+    # Confirmation prompt
+    if not args.yes:
+        logger.info("🗑️  Uninstalling: %s", plugin_name)
+        logger.info("   This will remove plugin files AND its entry from pluck.yaml")
+        response = input("Are you sure? [y/N] ")
+        if response.lower() != "y":
+            logger.info("Cancelled")
             return
-        for name in installed:
-            logger.info("🗑️  Uninstalling: %s", name)
-            uninstall_plugin(name, claude_dir)
-        logger.info("  ✅ All pluck plugins uninstalled")
 
-
-def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
-    """Handle 'select' command - interactive component selection."""
-    config = load_config()
-    repos_dir = get_repos_dir(claude_dir)
-    changed = False
-
-    for plugin in _filter_plugins(config, args.plugin):
-        name = plugin["name"]
-        logger.info("📦 %s: discovering components...", name)
-
-        repo_dir = repos_dir / name
-        try:
-            sha = clone_or_update(plugin["repo"], repo_dir, plugin["branch"])
-            logger.info("  Repo at commit: %s", sha)
-        except RuntimeError as e:
-            logger.error("  Failed: %s", e)
-            continue
-
-        old_components = plugin["components"]
-        new_components = interactive_select(name, repo_dir, old_components)
-
-        if new_components is None:
-            logger.info("  ⚠ Aborted for '%s'", name)
-            continue
-        if new_components != old_components:
-            plugin["components"] = new_components
-            changed = True
-            logger.info("  ✅ Selection updated for '%s'", name)
-        else:
-            logger.info("  No changes for '%s'", name)
-
-    if changed:
-        save_interactive_config(get_default_config_path(), config["plugins"])
-        logger.info("✅ Selection saved.")
-        logger.info("")
-
-    if args.install:
-        logger.info("Installing...")
-        for plugin in _filter_plugins(config, args.plugin):
-            repo_dir = repos_dir / plugin["name"]
-            install_plugin(plugin, repo_dir, claude_dir)
-            logger.info("  ✅ '%s' installed\n", plugin["name"])
-    elif not changed:
-        logger.info("No changes to save.")
+    logger.info("🗑️  Uninstalling: %s", plugin_name)
+    uninstall_plugin(plugin_name, claude_dir)
+    logger.info("  ✅ Done")
 
 
 def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
@@ -421,14 +408,34 @@ def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
 
 
 def cmd_status(args: argparse.Namespace, claude_dir: Path) -> None:
-    """Handle 'status' command."""
+    """Handle 'status' command — show active environment and installed plugins."""
+    from pluck.env import get_current_env
+
+    # Show active environment first
+    current = get_current_env()
+    if current:
+        logger.info("Environment: %s", current["name"])
+        logger.info("Path:       %s", current["path"])
+        logger.info("")
+    else:
+        default_dir = Path.home() / ".claude"
+        if claude_dir != default_dir.resolve():
+            # User has CLAUDE_CONFIG_DIR set but it's not a registered env
+            logger.info("Environment: custom (not managed by pluck)")
+            logger.info("Path:       %s", claude_dir)
+            logger.info("")
+        else:
+            logger.info("Environment: default (~/.claude/)")
+            logger.info("")
+
+    # Show installed plugins
     installed = get_installed_plugins(claude_dir)
 
     if not installed:
         logger.info("No pluck-managed plugins installed")
         return
 
-    logger.info("Pluck-managed plugins:\n")
+    logger.info("Plugins:\n")
     for name, entries in installed.items():
         for entry in entries:
             logger.info("  📦 %s@pluck", name)
@@ -451,8 +458,9 @@ def cmd_status(args: argparse.Namespace, claude_dir: Path) -> None:
 def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
     """Handle 'env' command — environment management."""
     from pluck.env import (
+        DEFAULT_ENV_DIR,
+        DEFAULT_ENV_NAME,
         create_env,
-        deactivate_command,
         delete_env,
         get_current_env,
         init_command,
@@ -472,53 +480,41 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
             sys.stdout.flush()
         except ValueError as e:
             logger.error("Cannot create environment: %s", e)
-            raise
+            sys.exit(1)
 
     elif args.env_command == "list":
-        envs = list_envs()
-        if not envs:
-            logger.info("No environments created yet.")
-            logger.info("Create one with: pluck env create <name>")
-            return
-
         current = get_current_env()
         current_path = str(current["path"]) if current else None
+        # Default env is active when no pluck-managed env is current
+        default_active = current is None
 
         logger.info("Environments:")
-        for env in envs:
+        marker = "*" if default_active else " "
+        logger.info(
+            "  %s %-20s %s  (default)",
+            marker, DEFAULT_ENV_NAME, DEFAULT_ENV_DIR,
+        )
+
+        for env in list_envs():
             active = "*" if env["path"] == current_path else " "
             logger.info("  %s %-20s %s", active, env["name"], env["path"])
 
     elif args.env_command == "switch":
         if not args.name:
-            logger.error("Environment name required for switch")
+            logger.error("Environment name required. Use 'default' to switch back.")
             return
         try:
             cmd = switch_env_command(args.name)
             sys.stdout.write(cmd + "\n")
             sys.stdout.flush()
         except ValueError as e:
-            print(f"pluck: {type(e).__name__}: {e}", file=sys.stderr)
-
-    elif args.env_command == "deactivate":
-        cmd = deactivate_command()
-        sys.stdout.write(cmd + "\n")
-        sys.stdout.flush()
+            logger.error("%s", e)
+            sys.exit(1)
 
     elif args.env_command == "init":
         cmd = init_command(args.shell)
         sys.stdout.write(cmd + "\n")
         sys.stdout.flush()
-
-    elif args.env_command == "current":
-        current = get_current_env()
-        if current:
-            logger.info("Active environment: %s", current["name"])
-            logger.info("Path:             %s", current["path"])
-            logger.info("Created:          %s", current.get("created_at", "unknown"))
-        else:
-            logger.info("No pluck environment active.")
-            logger.info("Using default Claude config: %s", claude_dir)
 
     elif args.env_command == "delete":
         try:
@@ -526,11 +522,11 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
             logger.info("Deleted environment '%s'", args.name)
         except ValueError as e:
             logger.error("Cannot delete: %s", e)
-            raise
+            sys.exit(1)
 
     else:
         logger.error(
-            "Unknown env action. Available: create, list, switch, deactivate, init, current, delete"
+            "Unknown env action. Available: create, list, switch, init, delete"
         )
 
 

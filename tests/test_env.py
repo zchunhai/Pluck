@@ -8,12 +8,13 @@ from unittest.mock import patch
 import pytest
 
 from pluck.env import (
+    DEFAULT_ENV_DIR,
+    DEFAULT_ENV_NAME,
     EnvironmentEntry,
     _create_skeleton,
     _load_registry,
     _save_registry,
     create_env,
-    deactivate_command,
     delete_env,
     get_current_env,
     get_env_path,
@@ -289,11 +290,20 @@ class TestSwitchCommand:
             switch_env_command("missing")
 
 
-class TestDeactivateCommand:
-    def test_output_format(self) -> None:
-        cmd = deactivate_command()
+class TestSwitchDefault:
+    def test_switch_default_unsets_var(self) -> None:
+        cmd = switch_env_command(DEFAULT_ENV_NAME)
         assert "unset CLAUDE_CONFIG_DIR" in cmd
         assert "echo" in cmd
+
+    def test_switch_default_case_insensitive(self) -> None:
+        cmd = switch_env_command("Default")
+        assert "unset CLAUDE_CONFIG_DIR" in cmd
+
+    def test_switch_default_ignores_registry(self) -> None:
+        """'default' always works even with empty registry."""
+        cmd = switch_env_command("default")
+        assert "unset CLAUDE_CONFIG_DIR" in cmd
 
 
 # ────────────────────────────────────────────────────────────────

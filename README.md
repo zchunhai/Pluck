@@ -1,6 +1,6 @@
 # Pluck - Selective Claude Plugin Installer
 
-A CLI tool to selectively install components (skills, agents, commands, rules, hooks) from Claude Code plugins hosted on GitHub.
+A CLI tool to selectively install components (skills, agents, commands, rules, hooks, contexts) from Claude Code plugins hosted on GitHub.
 
 ## Features
 
@@ -15,7 +15,7 @@ Claude plugins like [ECC](https://github.com/affaan-m/ECC) contain 100+ componen
 
 ## How It Works
 
-1. **Clone** plugin repos to your Claude config directory
+1. **Clone** plugin repos to shared cache (`~/.cache/pluck/repos/`)
 2. **Filter** components based on your `pluck.yaml` config
 3. **Install** only the selected components as a registered plugin
 4. **Use** components with the standard `plugin:component` syntax (e.g., `/ecc:react-patterns`)
@@ -62,12 +62,11 @@ Isolate your Claude Code configuration by project or use case:
 
 ```bash
 pluck env create myproject              # Create new environment (auto-activates)
-pluck env create work --path ~/work    # Create at custom path
-pluck env list                         # List all environments
-pluck env current                       # Show active environment
-pluck env switch coding                # Switch to environment (manual eval only)
-pluck env deactivate                    # Deactivate (manual eval only)
-pluck env delete myproject             # Delete environment
+pluck env create work --path ~/work     # Create at custom path
+pluck env list                          # List all environments (including default)
+pluck env switch coding                 # Switch to environment (manual eval only)
+pluck env switch default                # Switch back to default (~/.claude)
+pluck env delete myproject              # Delete environment
 pluck env init                          # Generate shell wrapper (one-time setup)
 ```
 
@@ -80,7 +79,7 @@ source ~/.zshrc
 
 ⚠️ **Important**: Use `>>` (append) not `>` (overwrite) to preserve your existing config. After adding the wrapper, restart your shell or run `source ~/.zshrc` to activate it.
 
-Once activated, `pluck env create`, `pluck env switch`, and `pluck env deactivate` will automatically modify your shell's environment — no manual `eval` needed.
+Once activated, `pluck env create` and `pluck env switch` will automatically modify your shell's environment — no manual `eval` needed.
 
 Each environment is a self-contained Claude config directory with its own:
 - `pluck.yaml` — plugin selections
@@ -93,36 +92,29 @@ Each environment is a self-contained Claude config directory with its own:
 #### `install`
 Install all or specific plugins from config:
 ```bash
-pluck install                    # Install all
-pluck install -p ecc             # Install only ecc
+pluck install                    # Interactive selection, then install all
+pluck install -y                 # Non-interactive: use config as-is
+pluck install -p ecc             # Interactive selection for ecc only
 pluck install --dry-run          # Preview without installing
-pluck install --repo <url>       # Add plugin from URL and install
-pluck install --repo <url> --all # Add + install all components
+pluck install --repo <url>       # Add plugin, interactive selection, then install
+pluck install --repo <url> --all # Add + install all components (non-interactive)
 ```
 
-### `update`
+#### `update`
 Update repos and reinstall:
 ```bash
 pluck update                    # Update all
 pluck update -p ecc             # Update only ecc
 ```
 
-### `uninstall`
-Remove pluck-managed plugins:
+#### `uninstall`
+Remove pluck-managed plugins (confirmation required):
 ```bash
-pluck uninstall ecc             # Uninstall specific plugin
-pluck uninstall                 # Uninstall all pluck plugins
+pluck uninstall ecc             # Uninstall with confirmation
+pluck uninstall -y ecc          # Uninstall without confirmation
 ```
 
-### `select`
-Interactively select components (saves to config):
-```bash
-pluck select                    # Select for all plugins
-pluck select -p ecc             # Select for ecc only
-pluck select --install          # Install after selecting
-```
-
-### `list`
+#### `list`
 List available components with three-state display:
 ```bash
 pluck list                      # Show all (✓ installed, ⚠ configured, · available)
@@ -130,15 +122,15 @@ pluck list -p ecc               # Show only ecc components
 pluck list -t skills            # Show only skills
 ```
 
-### `status`
-Show currently installed pluck plugins:
+#### `status`
+Show active environment and installed plugins:
 ```bash
 pluck status
 ```
 
 ## Configuration
 
-Config file: `pluck.yaml` (or specify with `-c path/to/config.yaml`)
+Config file: `$CLAUDE_CONFIG_DIR/pluck.yaml`
 
 ```yaml
 plugins:
@@ -193,7 +185,8 @@ pluck/
 │   ├── __main__.py       # python -m pluck support
 │   ├── cli.py            # CLI entry point (argparse)
 │   ├── config.py         # Config parsing + path management
-│   ├── env.py            # Environment management (NEW)
+│   ├── env.py            # Environment management
+│   ├── io_utils.py       # Atomic file write utilities
 │   ├── installer.py      # Plugin creation + registration
 │   ├── interactive.py    # Config saving
 │   ├── repo.py           # Git clone/update + component discovery
@@ -215,18 +208,18 @@ Pluck stores data in the following locations:
 └── environments.json               # Environment registry
 
 ~/.cache/pluck/
-└── repos/                        # Shared plugin repo cache
+└── repos/                          # Shared plugin repo cache
 
 ~/.claude-envs/                     # Default environment home
-└── <name>/                        # Per-environment directories
-    ├── pluck.yaml                 # Plugin selections for this env
+└── <name>/                         # Per-environment directories
+    ├── pluck.yaml                  # Plugin selections for this env
     ├── plugins/
     │   ├── pluck/
-    │   │   └── <name>/            # Installed plugins (env-specific)
-    │   └── installed_plugins.json # Plugin registry (env-specific)
-    ├── settings.json              # Claude settings (env-specific)
-    ├── CLAUDE.md                  # Global instructions (env-specific)
-    └── memory/                    # Session memory (env-specific)
+    │   │   └── <name>/             # Installed plugins (env-specific)
+    │   └── installed_plugins.json  # Plugin registry (env-specific)
+    ├── settings.json               # Claude settings (env-specific)
+    ├── CLAUDE.md                   # Global instructions (env-specific)
+    └── memory/                     # Session memory (env-specific)
 ```
 
 **Key design**: Plugin repos are cached in `~/.cache/pluck/repos/` and shared across all environments, avoiding redundant downloads. Only the filtered installations are environment-specific.
