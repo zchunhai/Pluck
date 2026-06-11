@@ -42,19 +42,32 @@ def get_default_config_path() -> Path:
     return get_claude_config_dir() / CONFIG_FILE_NAME
 
 
-def load_config() -> dict[str, Any]:
-    """Load and validate pluck configuration file from $CLAUDE_CONFIG_DIR/pluck.yaml."""
-    config_path = get_default_config_path()
+def ensure_config_file(config_path: Path) -> None:
+    """Create a minimal config file if it does not exist."""
+    if config_path.exists():
+        return
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("plugins: []\n")
 
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+def load_config() -> dict[str, Any]:
+    """Load and validate pluck configuration file from $CLAUDE_CONFIG_DIR/pluck.yaml.
+
+    Creates an empty config file if it does not exist.
+    """
+    config_path = get_default_config_path()
 
     if yaml is None:
         raise ImportError("PyYAML is required. Install with: pip install pyyaml")
 
+    ensure_config_file(config_path)
+
     with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    if config is None:
+        config = {"plugins": []}
 
     return validate_config(config)
 

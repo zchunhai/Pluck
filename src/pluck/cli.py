@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from pluck.config import (
     COMPONENT_TYPES,
+    ensure_config_file,
     get_claude_config_dir,
     get_default_config_path,
     get_install_dir,
@@ -109,6 +110,7 @@ def main() -> None:
         sys.exit(1)
 
     claude_dir = get_claude_config_dir()
+    ensure_config_file(get_default_config_path())
     logger.debug("Claude config dir: %s", claude_dir)
 
     try:
@@ -121,9 +123,6 @@ def main() -> None:
             "status": lambda: cmd_status(args, claude_dir),
         }
         handlers[args.command]()
-    except FileNotFoundError as e:
-        logger.error("Error: %s", e)
-        sys.exit(1)
     except Exception as e:
         logger.error("Error: %s", e)
         if args.verbose:
@@ -152,10 +151,7 @@ def _ensure_repo_in_config(args: argparse.Namespace) -> None:
     name = args.plugin or _extract_plugin_name(args.repo)
     config_path = get_default_config_path()
 
-    try:
-        config = load_config()
-    except FileNotFoundError:
-        config = {"plugins": []}
+    config = load_config()
 
     for existing in config["plugins"]:
         if existing["name"] == name:
