@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import logging
+import signal
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -34,6 +35,12 @@ from pluck.interactive import save_config as save_interactive_config
 from pluck.repo import clone_or_update, discover_components
 
 logger = logging.getLogger("pluck")
+
+
+def _sigint_handler(signum: int, frame: object) -> None:
+    """Handle Ctrl+C gracefully."""
+    print("\n\n⚠  Interrupted.")
+    sys.exit(130)
 
 
 def main() -> None:
@@ -108,6 +115,8 @@ def main() -> None:
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
 
     claude_dir = get_claude_config_dir()
     ensure_config_file(get_default_config_path())
@@ -215,6 +224,9 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
             new_components = interactive_select(
                 plugin["name"], repo_dir, plugin["components"]
             )
+            if new_components is None:
+                logger.info("  ⚠ Aborted, skipping install for '%s'", plugin["name"])
+                continue
             if new_components != plugin["components"]:
                 plugin["components"] = new_components
                 save_interactive_config(get_default_config_path(), config["plugins"])
@@ -285,6 +297,9 @@ def cmd_select(args: argparse.Namespace, claude_dir: Path) -> None:
         old_components = plugin["components"]
         new_components = interactive_select(name, repo_dir, old_components)
 
+        if new_components is None:
+            logger.info("  ⚠ Aborted for '%s'", name)
+            continue
         if new_components != old_components:
             plugin["components"] = new_components
             changed = True

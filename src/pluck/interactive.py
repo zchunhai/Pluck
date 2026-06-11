@@ -70,19 +70,15 @@ def interactive_select(
     plugin_name: str,
     repo_dir: Path,
     current_components: dict[str, Any],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Run interactive component selection for a single plugin.
 
     Space to toggle, Enter to confirm. Up/Down or j/k to move cursor.
-    / to filter, a for all, n for none.
-
-    Args:
-        plugin_name: Plugin name for display.
-        repo_dir: Path to the cloned repository.
-        current_components: Current component selections from config.
+    / to filter, a for all, n for none, q to reset category,
+    Q or Ctrl+C to abort everything.
 
     Returns:
-        Updated component selections dict.
+        Updated component selections dict, or None if user aborted.
     """
     available = discover_components(repo_dir)
 
@@ -91,7 +87,8 @@ def interactive_select(
     )
     print(f"\n{BOLD}📦 {plugin_name}{RESET} ({total_counts})")
     print(
-        f"  {DIM}[space] toggle  [enter] confirm  [a] all  [n] none  [/] filter  [q] quit{RESET}"
+        f"  {DIM}[space] toggle  [enter] confirm  [a] all  [n] none  "
+        f"[/] filter  [q] reset  [Q] abort{RESET}"
     )
     print()
 
@@ -107,6 +104,8 @@ def interactive_select(
         current_names = _resolve_current_names(current, items)
 
         selected = _select_category_tui(comp_type, items, current_names)
+        if selected is None:
+            return None  # user aborted
         result[comp_type] = selected
 
     return result
@@ -125,17 +124,16 @@ def _select_category_tui(
     comp_type: str,
     items: list[str],
     current_names: set[str],
-) -> list[str] | str:
+) -> list[str] | str | None:
     """Terminal-UI selection for one component category.
 
-    Returns list of selected names, or "all".
+    Returns list of selected names, "all", or None if aborted.
     """
-    cursor = 0  # index into display_items
+    cursor = 0
     display_items = list(items)
     filter_keyword = ""
     selected = set(current_names)
 
-    # Pre-calculate available terminal height
     term_height = _term_height()
 
     print(HIDE_CURSOR, end="")
@@ -150,27 +148,35 @@ def _select_category_tui(
 
             key = _read_key()
 
-            if key in ("\r", "\n"):
-                # Enter — confirm
-                break
+            if key == "\x03":
+                # Ctrl+C — abort everything
+                _cleanup_frame(len(display_items) + 3)
+                print("\n  ⚠ Aborted.")
+                return None
 
-            elif key in ("q", "Q"):
-                # Quit without saving changes
+            if key in ("\r", "\n"):
+                break  # Enter — confirm
+
+            if key == "Q":
+                # Shift+Q — abort everything
+                _cleanup_frame(len(display_items) + 3)
+                print("\n  ⚠ Aborted.")
+                return None
+
+            if key == "q":
+                # q — reset this category to previous selection
                 selected = set(current_names)
                 break
 
-            elif key in ("\x1b[A", "k"):
-                # Up
+            if key in ("\x1b[A", "k"):
                 if display_items:
                     cursor = (cursor - 1) % len(display_items)
 
             elif key in ("\x1b[B", "j"):
-                # Down
                 if display_items:
                     cursor = (cursor + 1) % len(display_items)
 
             elif key == " ":
-                # Space — toggle
                 if display_items:
                     name = display_items[cursor]
                     if name in selected:
@@ -179,17 +185,14 @@ def _select_category_tui(
                         selected.add(name)
 
             elif key in ("a", "A"):
-                # Select all visible
                 for name in display_items:
                     selected.add(name)
 
             elif key in ("n", "N"):
-                # Deselect all visible
                 for name in display_items:
                     selected.discard(name)
 
             elif key == "/":
-                # Enter filter mode
                 _cleanup_frame(len(display_items) + 3)
                 new_kw = _read_filter_input(comp_type, filter_keyword)
                 filter_keyword = new_kw
@@ -197,14 +200,12 @@ def _select_category_tui(
                 cursor = 0
 
             elif key == "\x1b":
-                # Escape — keep current
-                break
+                break  # Escape — keep current
 
     finally:
         print(SHOW_CURSOR, end="")
         sys.stdout.flush()
 
-    # Determine return value
     if selected == set(items):
         return "all"
     return sorted(selected)
