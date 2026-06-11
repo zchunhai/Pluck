@@ -182,7 +182,12 @@ def _ensure_repo_in_config(args: argparse.Namespace) -> None:
 
 
 def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
-    """Handle 'install' command."""
+    """Handle 'install' command.
+
+    With --repo only (no --all): adds to config, runs interactive selection,
+    then installs. With --repo --all: adds to config with all components,
+    then installs. Without --repo: installs plugins already in config.
+    """
     if args.repo:
         _ensure_repo_in_config(args)
 
@@ -199,6 +204,21 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
         except RuntimeError as e:
             logger.error("  Failed: %s", e)
             continue
+
+        # --repo without --all: interactive selection for the new plugin
+        is_repo_plugin = args.repo and (
+            plugin["name"] == _extract_plugin_name(args.repo)
+            or (args.plugin and plugin["name"] == args.plugin)
+        )
+        if is_repo_plugin and not args.install_all:
+            logger.info("  Select components interactively (Enter = skip)...")
+            new_components = interactive_select(
+                plugin["name"], repo_dir, plugin["components"]
+            )
+            if new_components != plugin["components"]:
+                plugin["components"] = new_components
+                save_interactive_config(get_default_config_path(), config["plugins"])
+                logger.info("  ✅ Selection saved for '%s'", plugin["name"])
 
         if args.dry_run:
             _show_dry_run(plugin, repo_dir)

@@ -20,7 +20,7 @@ COMPONENT_TYPES = ("skills", "agents", "commands", "rules", "hooks", "contexts")
 def get_repos_dir(claude_config_dir: Path | None = None) -> Path:
     """Get the directory where plugin repos are cloned."""
     base = claude_config_dir or get_claude_config_dir()
-    return base / "plugins" / MARKETPLACE_NAME / "repos"
+    return base / MARKETPLACE_NAME / "repos"
 
 
 def get_install_dir(plugin_name: str, claude_config_dir: Path | None = None) -> Path:
