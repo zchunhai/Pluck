@@ -1,7 +1,9 @@
 """Interactive component selection and config saving for pluck."""
 
+import contextlib
 import logging
 import os
+import re
 import sys
 import termios
 import tty
@@ -18,39 +20,35 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ── TTY detection ──
-
 
 def _is_tty() -> bool:
-    """Check if stdin is a real terminal (not piped)."""
     return os.isatty(sys.stdin.fileno())
 
 
-# ── Terminal raw-mode ──────────────────────────────────────────────────
-
-
 def _read_key() -> str:
-    """Read a single keypress including arrow-key escape sequences.
+    """Read a single keypress. Returns \\x03 for Ctrl+C."""
+    if not _is_tty():
+        with contextlib.suppress(EOFError, KeyboardInterrupt):
+            sys.stdin.readline()
+        return "\\n"
 
-    Returns "\\x03" for Ctrl+C so callers can detect abort intent.
-    """
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
-        if ch == "\x03":
-            return "\x03"  # Ctrl+C
-        if ch == "\x1b":
+        if ch == "\\x03":
+            return "\\x03"
+        if ch == "\\x1b":
             new = list(old)
-            new[4] = 0  # VMIN = 0 (poll)
-            new[5] = 1  # VTIME = 0.1s
+            new[4] = 0
+            new[5] = 1
             termios.tcsetattr(fd, termios.TCSADRAIN, new)
             ch2 = sys.stdin.read(1)
             if ch2 == "[":
                 ch3 = sys.stdin.read(1)
                 if ch3 in ("A", "B", "C", "D"):
-                    return f"\x1b[{ch3}"
+                    return f"\\x1b[{ch3}"
                 return ch3
             return ch2 or ch
         return ch
@@ -58,189 +56,206 @@ def _read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-# ── ANSI codes ─────────────────────────────────────────────────────────
-
-CLEAR_BELOW = "\033[J"
-HIDE_CURSOR = "\033[?25l"
-SHOW_CURSOR = "\033[?25h"
-SAVE_CURSOR = "\033[s"
-RESTORE_CURSOR = "\033[u"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RESET = "\033[0m"
-GREEN = "\033[32m"
-CYAN = "\033[36m"
-YELLOW = "\033[33m"
+CLEAR_LINE = "\\033[2K"
+HIDE_CURSOR = "\\033[?25l"
+SHOW_CURSOR = "\\033[?25h"
+BOLD = "\\033[1m"
+DIM = "\\033[2m"
+RESET = "\\033[0m"
+GREEN = "\\033[32m"
+CYAN = "\\033[36m"
+YELLOW = "\\033[33m"
 
 
-# ── Interactive selection ──────────────────────────────────────────────
+def _term_width() -> int:
+    import shutil
+
+    return shutil.get_terminal_size().columns
+
+
+def _term_height() -> int:
+    import shutil
+
+    return shutil.get_terminal_size().lines
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\\033\\[[0-9;]*[a-zA-Z]", "", text)
+
+
+def _write_trunc(text: str, max_w: int) -> None:
+    visible = _strip_ansi(text)
+    if len(visible) <= max_w:
+        sys.stdout.write(text)
+        return
+    out = []
+    cnt = 0
+    esc = False
+    for ch in text:
+        if ch == "\\033":
+            esc = True
+            out.append(ch)
+        elif esc:
+            out.append(ch)
+            if ch == "m":
+                esc = False
+        else:
+            if cnt >= max_w:
+                break
+            cnt += 1
+            out.append(ch)
+    sys.stdout.write("".join(out))
+
+
+def _clear_frame(lines: int) -> None:
+    if lines <= 0:
+        return
+    for _ in range(lines):
+        sys.stdout.write(CLEAR_LINE + "\\r\\n")
+    sys.stdout.write(f"\\033[{lines}A")
+    sys.stdout.flush()
 
 
 def interactive_select(
-    plugin_name: str,
-    repo_dir: Path,
-    current_components: dict[str, Any],
+    plugin_name: str, repo_dir: Path, current_components: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Run interactive component selection for a single plugin.
-
-    Space to toggle, Enter to confirm. Up/Down or j/k to move cursor.
-    / to start inline filter, type to filter in real-time.
-    q to reset category, Q or Ctrl+C to abort everything.
-
-    Returns:
-        Updated component selections dict, or None if user aborted.
-    """
     available = discover_components(repo_dir)
-
     total_counts = " | ".join(
         f"{len(items)} {t}" for t, items in available.items() if items
     )
-    print(f"\n{BOLD}📦 {plugin_name}{RESET} ({total_counts})")
+    print(f"\\n{BOLD}📦 {plugin_name}{RESET} ({total_counts})")
     print(
-        f"  {DIM}[space] toggle  [enter] confirm  [a] all  [n] none  "
-        f"[/] filter  [q] reset  [Q] abort{RESET}"
+        f"  {DIM}[space] toggle  [enter] confirm  [a] all  [n] none  [/] filter  [q] reset  [Q] abort{RESET}"
     )
     print()
 
     result: dict[str, Any] = {}
-
     for comp_type in COMPONENT_TYPES:
         items = available.get(comp_type, [])
         if not items:
             result[comp_type] = []
             continue
-
         current = current_components.get(comp_type, [])
-        current_names = _resolve_current_names(current, items)
-
+        if current == "all":
+            current_names = set(items)
+        elif isinstance(current, list):
+            current_names = set(current)
+        else:
+            current_names = set()
         selected = _select_category(comp_type, items, current_names)
         if selected is None:
-            return None  # user aborted
+            return None
         result[comp_type] = selected
-
     return result
 
 
-def _resolve_current_names(current: list[str] | str, all_items: list[str]) -> set[str]:
-    """Resolve current selection to a set of names."""
-    if current == "all":
-        return set(all_items)
-    if isinstance(current, list):
-        return set(current)
-    return set()
-
-
 def _select_category(
-    comp_type: str,
-    items: list[str],
-    current_names: set[str],
+    comp_type: str, items: list[str], current_names: set[str]
 ) -> list[str] | str | None:
-    """Terminal-UI selection for one component category.
-
-    Returns list of selected names, "all", or None if aborted.
-    """
     cursor = 0
-    filter_keyword = ""
-    filter_mode = False  # True while user is typing a filter
+    filter_kw = ""
+    filter_mode = False
     selected = set(current_names)
+    prev_lines = 0
+    term_h = _term_height()
+    term_w = _term_width()
+    max_show = max(4, term_h - 5)
 
-    term_height = _term_height()
-    max_show = max(4, term_height - 5)  # 1 header + 1 filter + items + 1 help
+    if not _is_tty():
+        if selected == set(items):
+            return "all"
+        return sorted(selected)
 
-    sys.stdout.write(SAVE_CURSOR)
+    print()
     sys.stdout.write(HIDE_CURSOR)
     sys.stdout.flush()
 
     try:
         while True:
-            display_items = _apply_filter(items, filter_keyword)
-            # Clamp cursor if filter changed
-            if cursor >= len(display_items) and display_items:
-                cursor = len(display_items) - 1
-            elif not display_items:
+            filtered = _apply_filter(items, filter_kw)
+            if cursor >= len(filtered) and filtered:
+                cursor = len(filtered) - 1
+            elif not filtered:
                 cursor = 0
 
-            _render_frame(
+            prev_lines = _render_frame(
                 comp_type,
-                display_items,
+                filtered,
                 selected,
                 cursor,
-                filter_keyword,
+                filter_kw,
                 filter_mode,
                 max_show,
+                term_w,
+                prev_lines,
             )
 
             key = _read_key()
 
-            if key == "\x03":
-                sys.stdout.write(RESTORE_CURSOR)
-                sys.stdout.write(CLEAR_BELOW)
+            if key == "\\x03":
+                _clear_frame(prev_lines)
                 sys.stdout.write(SHOW_CURSOR)
                 sys.stdout.flush()
-                print("  ⚠ Aborted.")
+                print("  Aborted.")
                 return None
 
             if filter_mode:
-                # In filter mode: keys modify the filter string
-                if key in ("\r", "\n", "\x1b"):
+                if key == "\\x1b":
                     filter_mode = False
-                elif key in ("\x7f", "\x08"):
-                    # Backspace / Delete
-                    filter_keyword = filter_keyword[:-1]
-                elif len(key) == 1 and key.isprintable():
-                    filter_keyword += key
+                    continue
+                if key in ("\\x7f", "\\x08"):
+                    filter_kw = filter_kw[:-1]
+                    continue
+                if len(key) == 1 and key.isprintable():
+                    filter_kw += key
+                    continue
+
+            if key in ("\\r", "\\n"):
+                if filter_mode:
+                    filter_mode = False
+                else:
+                    break
                 continue
-
-            # Normal mode
-            if key in ("\r", "\n"):
-                break  # Enter — confirm
-
-            if key == "Q":
-                sys.stdout.write(RESTORE_CURSOR)
-                sys.stdout.write(CLEAR_BELOW)
-                sys.stdout.write(SHOW_CURSOR)
-                sys.stdout.flush()
-                print("  ⚠ Aborted.")
-                return None
-
-            if key == "q":
-                selected = set(current_names)
-                break
 
             if key == "/":
-                filter_mode = True
+                if not filter_mode:
+                    filter_mode = True
                 continue
 
-            if key in ("\x1b[A", "k"):
-                if display_items:
-                    cursor = (cursor - 1) % len(display_items)
-
-            elif key in ("\x1b[B", "j"):
-                if display_items:
-                    cursor = (cursor + 1) % len(display_items)
-
+            if key in ("\\x1b[A", "k"):
+                if filtered:
+                    cursor = (cursor - 1) % len(filtered)
+            elif key in ("\\x1b[B", "j"):
+                if filtered:
+                    cursor = (cursor + 1) % len(filtered)
             elif key == " ":
-                if display_items:
-                    name = display_items[cursor]
+                if filtered:
+                    name = filtered[cursor]
                     if name in selected:
                         selected.discard(name)
                     else:
                         selected.add(name)
-
             elif key in ("a", "A"):
-                for name in display_items:
+                for name in filtered:
                     selected.add(name)
-
             elif key in ("n", "N"):
-                for name in display_items:
+                for name in filtered:
                     selected.discard(name)
+            elif key == "\\x1b":
+                break
 
-            elif key == "\x1b":
-                break  # Escape — keep current
-
+            if not filter_mode:
+                if key == "Q":
+                    _clear_frame(prev_lines)
+                    sys.stdout.write(SHOW_CURSOR)
+                    sys.stdout.flush()
+                    print("  Aborted.")
+                    return None
+                if key == "q":
+                    selected = set(current_names)
+                    break
     finally:
-        sys.stdout.write(RESTORE_CURSOR)
-        sys.stdout.write(CLEAR_BELOW)
+        _clear_frame(prev_lines)
         sys.stdout.write(SHOW_CURSOR)
         sys.stdout.flush()
 
@@ -249,19 +264,7 @@ def _select_category(
     return sorted(selected)
 
 
-def _term_height() -> int:
-    """Get terminal height, defaulting to 24."""
-    try:
-        import shutil
-
-        size = shutil.get_terminal_size()
-        return size.lines
-    except Exception:
-        return 24
-
-
 def _apply_filter(items: list[str], keyword: str) -> list[str]:
-    """Filter items by keyword substring (case-insensitive)."""
     if not keyword:
         return list(items)
     kw = keyword.lower()
@@ -273,36 +276,33 @@ def _render_frame(
     items: list[str],
     selected: set[str],
     cursor: int,
-    filter_keyword: str,
+    filter_kw: str,
     filter_mode: bool,
     max_show: int,
-) -> None:
-    """Render the selection list with cursor and checkboxes.
+    term_w: int,
+    prev_lines: int,
+) -> int:
+    if prev_lines > 0:
+        sys.stdout.write(f"\\033[{prev_lines}A")
 
-    Uses cursor save/restore to avoid line-wrapping flicker artifacts.
-    """
-    sys.stdout.write(RESTORE_CURSOR)
-    sys.stdout.write(CLEAR_BELOW)
+    lines = []
 
-    lines: list[str] = []
-
-    # ── Filter bar (always visible at top) ──
     if filter_mode:
-        bar = f"{YELLOW}filter:{RESET} {filter_keyword}{BOLD}█{RESET}"
-    elif filter_keyword:
-        bar = f"{DIM}filter: {filter_keyword}  [/] to edit{RESET}"
+        lines.append(f"  {YELLOW}filter:{RESET} {filter_kw}{BOLD}_{RESET}")
+    elif filter_kw:
+        lines.append(f"  {DIM}filter: {filter_kw}  [/] to edit{RESET}")
     else:
-        bar = f"{DIM}[/] filter{RESET}"
-    lines.append(f"  {bar}")
+        lines.append(f"  {DIM}[/] filter{RESET}")
 
-    # ── Category header ──
-    header = f"{CYAN}── {comp_type}{RESET}  ({GREEN}{len(selected)}{RESET}/{len(items)} selected)"
-    lines.append(header)
+    lines.append(
+        f"{CYAN}-- {comp_type}{RESET}  "
+        f"({GREEN}{len(selected)}{RESET}/{len(items)} selected)"
+    )
 
-    # ── Items ──
     total = len(items)
     if total == 0:
         lines.append(f"  {DIM}(no matches){RESET}")
+        start = end = 0
     elif total <= max_show:
         start, end = 0, total
     else:
@@ -312,20 +312,18 @@ def _render_frame(
         if end - start < max_show:
             start = max(0, end - max_show)
 
-    for i in range(start, end) if total > 0 else []:
+    for i in range(start, end):
         name = items[i]
         is_sel = name in selected
         is_cur = i == cursor
-        checkbox = f"{GREEN}✓{RESET}" if is_sel else " "
-        pointer = f"{BOLD}>{RESET}" if is_cur else " "
-
+        chk = f"{GREEN}v{RESET}" if is_sel else " "
+        ptr = f"{BOLD}>{RESET}" if is_cur else " "
         if is_cur:
-            line = f" {pointer} [{checkbox}] {BOLD}{name}{RESET}"
+            lines.append(f" {ptr} [{chk}] {BOLD}{name}{RESET}")
         elif is_sel:
-            line = f" {pointer} [{checkbox}] {GREEN}{name}{RESET}"
+            lines.append(f" {ptr} [{chk}] {GREEN}{name}{RESET}")
         else:
-            line = f" {pointer} [{checkbox}] {DIM}{name}{RESET}"
-        lines.append(line)
+            lines.append(f" {ptr} [{chk}] {DIM}{name}{RESET}")
 
     if total > 0:
         if start > 0:
@@ -333,29 +331,33 @@ def _render_frame(
         if end < total:
             lines.append(f"  {DIM}... {total - end} more below{RESET}")
 
-    # ── Help ──
     if filter_mode:
-        help_line = f"{YELLOW}  [type to filter] [enter/esc] done{RESET}"
+        lines.append(
+            f"{YELLOW}  [type + arrows to filter and pick]  "
+            f"[enter/esc] exit filter{RESET}"
+        )
     else:
-        help_line = (
-            f"{DIM}  [space] toggle  [↑↓/jk] move  [a] all  [n] none  "
+        lines.append(
+            f"{DIM}  [space] toggle  [arrows/jk] move  [a] all  [n] none  "
             f"[/] filter  [enter] confirm  [q] reset  [Q] abort{RESET}"
         )
-    lines.append(help_line)
 
-    sys.stdout.write("\n".join(lines))
+    for i, line in enumerate(lines):
+        sys.stdout.write(CLEAR_LINE + "\\r")
+        _write_trunc(line, term_w - 1)
+        if i < len(lines) - 1:
+            sys.stdout.write("\\n")
+
+    if prev_lines > len(lines):
+        for _ in range(prev_lines - len(lines)):
+            sys.stdout.write("\\n" + CLEAR_LINE + "\\r")
+        sys.stdout.write(f"\\033[{prev_lines - len(lines)}A")
+
     sys.stdout.flush()
-
-
-# ── Config saving ──────────────────────────────────────────────────────
+    return len(lines)
 
 
 def save_config(config_path: Path, plugins: list[dict[str, Any]]) -> None:
-    """Save updated plugin configs back to YAML file.
-
-    Merges new component selections into the existing file, preserving
-    any extra keys or top-level fields the user may have added.
-    """
     if yaml is None:
         raise ImportError("PyYAML is required")
 
@@ -368,8 +370,8 @@ def save_config(config_path: Path, plugins: list[dict[str, Any]]) -> None:
             pass
 
     original_plugins = original.get("plugins", [])
-
     updated_plugins = []
+
     for plugin in plugins:
         name = plugin["name"]
         orig_entry: dict[str, Any] = next(
@@ -393,11 +395,7 @@ def save_config(config_path: Path, plugins: list[dict[str, Any]]) -> None:
 
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(
-            data,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            sort_keys=False,
+            data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
         )
 
     logger.info("Config saved to %s", config_path)
