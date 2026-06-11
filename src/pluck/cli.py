@@ -43,8 +43,8 @@ def main() -> None:
     parser.add_argument(
         "-c",
         "--config",
-        default="pluck.yaml",
-        help="Config file path (default: pluck.yaml)",
+        default=None,
+        help="Config file path (default: $CLAUDE_CONFIG_DIR/pluck.yaml)",
     )
     parser.add_argument(
         "-v",

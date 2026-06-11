@@ -9,7 +9,7 @@ try:
 except ImportError:
     yaml = None
 
-DEFAULT_CONFIG_NAME = "pluck.yaml"
+CONFIG_FILE_NAME = "pluck.yaml"
 
 # Marketplace name used in plugin registry keys: <name>@pluck
 MARKETPLACE_NAME = "pluck"
@@ -37,10 +37,15 @@ def get_claude_config_dir() -> Path:
     return Path.home() / ".claude"
 
 
+def get_default_config_path() -> Path:
+    """Default config path: $CLAUDE_CONFIG_DIR/pluck.yaml."""
+    return get_claude_config_dir() / CONFIG_FILE_NAME
+
+
 def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """Load and validate pluck configuration file."""
     if config_path is None:
-        config_path = DEFAULT_CONFIG_NAME
+        config_path = get_default_config_path()
 
     config_path = Path(config_path)
     if not config_path.exists():
