@@ -200,12 +200,13 @@ def create_env(
 def delete_env(name: str) -> None:
     """Delete an environment's directory and remove it from the registry.
 
-    Refuses to delete the currently active environment.
+    Callers should handle the case where the target environment is currently
+    active (e.g., switch to default first).
 
     Raises
     ------
     ValueError
-        If the environment is not found or is currently active.
+        If the environment is not found.
     """
     name_lower = name.lower()
     environments = _load_registry()
@@ -221,16 +222,6 @@ def delete_env(name: str) -> None:
 
     entry = environments[idx]
     env_path = Path(entry["path"])
-
-    # Refuse to delete the active environment
-    active_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if active_dir and Path(active_dir).resolve() == env_path.resolve():
-        raise ValueError(
-            f"Cannot delete the active environment '{entry['name']}'.\n"
-            f"Deactivate first with:\n"
-            f'  eval "$(pluck env deactivate)"\n'
-            f"Then try again."
-        )
 
     if env_path.exists():
         shutil.rmtree(env_path)

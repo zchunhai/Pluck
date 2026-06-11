@@ -189,13 +189,17 @@ class TestDeleteEnv:
         assert len(_load_registry()) == 0
         assert not (temp_env_home / "to_delete").exists()
 
-    def test_refuses_active_env(
+    def test_deletes_active_env(
         self, temp_registry: Path, temp_env_home: Path
     ) -> None:
+        """delete_env no longer rejects active environments — that check
+        is now at the CLI layer (cmd_env), which auto-switches to default
+        before calling delete_env."""
         env_path = create_env("active")
-        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(env_path)}), \
-             pytest.raises(ValueError, match="active environment"):
-            delete_env("active")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(env_path)}):
+            delete_env("active")  # should not raise
+        assert len(_load_registry()) == 0
+        assert not (temp_env_home / "active").exists()
 
     def test_rejects_nonexistent(self, temp_registry: Path) -> None:
         with pytest.raises(ValueError, match="not found"):

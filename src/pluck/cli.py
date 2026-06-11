@@ -303,23 +303,12 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
 
 
 def cmd_update(args: argparse.Namespace, claude_dir: Path) -> None:
-    """Handle 'update' command."""
-    config = load_config()
-    repos_dir = get_repos_dir(claude_dir)
-
-    for plugin in _filter_plugins(config, args.plugin):
-        logger.info("🔄 Updating: %s", plugin["name"])
-
-        repo_dir = repos_dir / plugin["name"]
-        try:
-            sha = clone_or_update(plugin["repo"], repo_dir, plugin["branch"])
-            logger.info("  Updated to: %s", sha)
-        except RuntimeError as e:
-            logger.error("  Failed: %s", e)
-            continue
-
-        install_plugin(plugin, repo_dir, claude_dir)
-        logger.info("  ✅ '%s' reinstalled\n", plugin["name"])
+    """Handle 'update' command — delegates to install in non-interactive mode."""
+    args.repo = None
+    args.install_all = False
+    args.dry_run = False
+    args.yes = True
+    cmd_install(args, claude_dir)
 
 
 def cmd_uninstall(args: argparse.Namespace, claude_dir: Path) -> None:
@@ -517,9 +506,31 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
         sys.stdout.flush()
 
     elif args.env_command == "delete":
+        name = args.name
+        current = get_current_env()
+        active_match = current and current["name"].lower() == name.lower()
+
+        if active_match:
+            logger.info(
+                "⚠️  '%s' is the active environment. It will be "
+                "switched to default before deletion.", name
+            )
+        else:
+            logger.info("⚠️  This will delete environment '%s' and its contents.", name)
+
+        response = input("Are you sure? [y/N] ")
+        if response.lower() != "y":
+            logger.info("Cancelled")
+            return
+
+        # If active, switch to default first
+        if active_match:
+            sys.stdout.write(switch_env_command(DEFAULT_ENV_NAME) + "\n")
+            sys.stdout.flush()
+
         try:
-            delete_env(args.name)
-            logger.info("Deleted environment '%s'", args.name)
+            delete_env(name)
+            logger.info("Deleted environment '%s'", name)
         except ValueError as e:
             logger.error("Cannot delete: %s", e)
             sys.exit(1)
