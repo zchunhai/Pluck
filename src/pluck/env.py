@@ -35,11 +35,28 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# XDG-compliant registry location, independent of any Claude config dir.
-_ENV_REGISTRY_DIR = Path(
-    os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-) / "pluck"
+# Configurable via PLUCK_CONFIG_DIR env var; defaults to XDG_CONFIG_HOME/pluck
+def _get_pluck_dir() -> Path:
+    """Return the pluck config directory, respecting environment variables."""
+    custom = os.environ.get("PLUCK_CONFIG_DIR")
+    if custom:
+        return Path(custom)
+    xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    return Path(xdg) / "pluck"
+
+
+_ENV_REGISTRY_DIR = _get_pluck_dir()
 ENV_REGISTRY_PATH = _ENV_REGISTRY_DIR / "environments.json"
+
+
+def _refresh_paths() -> None:
+    """Re-read PLUCK_CONFIG_DIR env var to update paths.
+
+    Call this in test setup after setting the env var.
+    """
+    global _ENV_REGISTRY_DIR, ENV_REGISTRY_PATH
+    _ENV_REGISTRY_DIR = _get_pluck_dir()
+    ENV_REGISTRY_PATH = _ENV_REGISTRY_DIR / "environments.json"
 
 # Default directory where environments are created (virtualenvwrapper-style).
 DEFAULT_ENV_HOME = Path.home() / ".claude-envs"

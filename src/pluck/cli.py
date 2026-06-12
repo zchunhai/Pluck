@@ -37,7 +37,7 @@ from pluck.installer import (
 )
 from pluck.interactive import save_config as save_interactive_config
 from pluck.repo import clone_or_update, discover_components
-from pluck.tab_ui import interactive_remove, interactive_select
+from pluck.tab_ui import interactive_remove, interactive_select, select_from_list
 
 logger = logging.getLogger("pluck")
 
@@ -78,8 +78,8 @@ def main() -> None:
 
     env_sub.add_parser("list", help="List all environments")
 
-    env_switch = env_sub.add_parser("switch", help="Activate an environment")
-    env_switch.add_argument("name", help="Environment to switch to")
+    env_switch = env_sub.add_parser("switch", help="Activate an environment (TUI if no name)")
+    env_switch.add_argument("name", nargs="?", help="Environment to switch to")
 
     env_init = env_sub.add_parser("init", help="Generate shell wrapper for auto-switching")
     env_init.add_argument(
@@ -159,6 +159,47 @@ def main() -> None:
     # --- status ---
     subparsers.add_parser("status", help="Show installation status")
 
+    # --- model ---
+    model_p = subparsers.add_parser("model", help="Manage model providers")
+    model_sub = model_p.add_subparsers(dest="model_command", help="Available model actions")
+
+    model_sub.add_parser("list", help="List available providers")
+
+    model_sub.add_parser("current", help="Show current model configuration")
+
+    model_switch = model_sub.add_parser("switch", help="Switch to a provider (TUI if no name)")
+    model_switch.add_argument("provider", nargs="?", help="Provider name (e.g., zhipu, deepseek)")
+    model_switch.add_argument(
+        "--tier",
+        choices=["opus", "sonnet", "haiku"],
+        help="Model tier (defaults to provider's default)",
+    )
+
+    model_sub.add_parser("reset", help="Reset to default provider (anthropic)")
+
+    model_add = model_sub.add_parser("add", help="Add a custom provider (interactive wizard)")
+    model_add.add_argument("name", nargs="?", help="Provider identifier")
+    model_add.add_argument("--display-name", help="Human-readable name")
+    model_add.add_argument("--base-url", help="API base URL")
+    model_add.add_argument(
+        "--sonnet-model", help="Model ID for sonnet tier",
+    )
+    model_add.add_argument(
+        "--haiku-model", help="Model ID for haiku tier",
+    )
+    model_add.add_argument(
+        "--opus-model", help="Model ID for opus tier",
+    )
+    model_add.add_argument(
+        "--default-tier",
+        choices=["opus", "sonnet", "haiku"],
+        default="sonnet",
+        help="Default tier (default: sonnet)",
+    )
+
+    model_remove = model_sub.add_parser("remove", help="Remove a provider")
+    model_remove.add_argument("name", help="Provider identifier to remove")
+
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -180,6 +221,7 @@ def main() -> None:
             "uninstall": lambda: cmd_uninstall(args, claude_dir),
             "list": lambda: cmd_list(args, claude_dir),
             "status": lambda: cmd_status(args, claude_dir),
+            "model": lambda: cmd_model(args),
         }
         handlers[args.command]()
     except (ValueError, RuntimeError, ImportError, OSError) as e:
@@ -266,9 +308,10 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
     """
     config = load_config()
 
-    # Add from --repo URL
+    # Add from --repo URL, then reload so the new entry is visible
     if args.repo:
         _ensure_repo_in_config(args)
+        config = load_config()
 
     repos_dir = get_repos_dir(claude_dir)
     changed = False
@@ -677,11 +720,18 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
             logger.info("  %s %-20s %s", active, env["name"], env["path"])
 
     elif args.env_command == "switch":
-        if not args.name:
-            logger.error("Environment name required. Use 'default' to switch back.")
-            return
+        name = args.name
+        if not name:
+            # TUI selection
+            current = get_current_env()
+            current_name = current["name"] if current else DEFAULT_ENV_NAME
+            env_names = [DEFAULT_ENV_NAME] + [e["name"] for e in list_envs()]
+            name = select_from_list(env_names, current=current_name, title="Select environment")
+            if name is None:
+                return
+
         try:
-            cmd = switch_env_command(args.name)
+            cmd = switch_env_command(name)
             sys.stdout.write(cmd + "\n")
             sys.stdout.flush()
         except ValueError as e:
@@ -764,3 +814,247 @@ def _show_dry_run(plugin_config: dict[str, Any], repo_dir: Path) -> None:
             logger.info("    %s (%d): %s", comp_type, len(items), ", ".join(items))
         else:
             logger.info("    %s: no matching components found", comp_type)
+
+
+def cmd_model(args: argparse.Namespace) -> None:
+    """Handle 'model' command — unified model provider management."""
+    from pluck.model import (
+        get_current_model,
+        list_providers,
+        remove_provider,
+        reset_to_default,
+        switch_provider,
+    )
+
+    if args.model_command == "list":
+        list_providers()
+
+    elif args.model_command == "current":
+        current = get_current_model()
+        logger.info("Current model configuration:\n")
+        logger.info("  Provider: %s", current["provider"])
+        logger.info("  Tier:     %s", current["model"])
+        logger.info("  Base URL: %s", current["base_url"])
+        logger.info("  Model:    %s", current["anthropic_model"])
+
+    elif args.model_command == "switch":
+        provider_name = args.provider
+        if not provider_name:
+            # TUI selection
+            from pluck.providers import list_providers as get_all_providers
+
+            providers = get_all_providers()
+            if not providers:
+                logger.info("No providers configured. Use 'pluck model add' first.")
+                return
+
+            current = get_current_model()
+            names = [p.name for p in sorted(providers, key=lambda p: p.name)]
+            provider_name = select_from_list(
+                names, current=current["provider"], title="Select model provider",
+            )
+            if provider_name is None:
+                return
+
+        try:
+            switch_provider(provider_name, args.tier)
+            logger.info(
+                "\n✅ Switched model. Restart Claude Code to apply changes."
+            )
+        except ValueError as e:
+            logger.error("%s", e)
+            sys.exit(1)
+
+    elif args.model_command == "reset":
+        try:
+            reset_to_default()
+            logger.info(
+                "\n✅ Reset to Anthropic. Restart Claude Code to apply changes."
+            )
+        except ValueError as e:
+            logger.error("%s", e)
+            sys.exit(1)
+
+    elif args.model_command == "add":
+        # Interactive wizard (default) or CLI flags for scripting
+        has_cli_flags = args.base_url and (
+            args.sonnet_model or args.haiku_model or args.opus_model
+        )
+        if args.name and has_cli_flags:
+            _add_provider_cli(args)
+        else:
+            _add_provider_wizard(args)
+
+    elif args.model_command == "remove":
+        try:
+            remove_provider(args.name)
+            logger.info("✅ Removed provider '%s'", args.name)
+        except ValueError as e:
+            logger.error("%s", e)
+            sys.exit(1)
+
+    else:
+        logger.error(
+            "Unknown model action. Available: list, current, switch, reset, add, remove"
+        )
+        sys.exit(1)
+
+
+def _add_provider_cli(args: argparse.Namespace) -> None:
+    """Non-interactive provider add via CLI flags (for scripting)."""
+    from pluck.model import ModelTier, ProviderConfig, add_provider
+
+    models: dict[str, ModelTier] = {}
+    if args.sonnet_model:
+        models["sonnet"] = ModelTier(id=args.sonnet_model)
+    if args.haiku_model:
+        models["haiku"] = ModelTier(id=args.haiku_model)
+    if args.opus_model:
+        models["opus"] = ModelTier(id=args.opus_model)
+
+    if not models:
+        logger.error("At least one model tier is required (--sonnet-model, --haiku-model, or --opus-model)")
+        sys.exit(1)
+
+    display_name = args.display_name or args.name
+    config = ProviderConfig(
+        name=args.name,
+        display_name=display_name,
+        base_url=args.base_url,
+        models=models,
+        default_tier=args.default_tier,
+    )
+
+    try:
+        add_provider(config)
+        logger.info("✅ Added provider '%s'", args.name)
+    except ValueError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+
+
+def _add_provider_wizard(args: argparse.Namespace) -> None:
+    """Interactive wizard for adding a model provider."""
+    import getpass
+
+    from pluck.model import ModelTier, ProviderConfig, add_provider
+
+    is_tty = sys.stdin.isatty()
+
+    print("\n📦 Add a new model provider\n")
+
+    # --- Name ---
+    if args.name:
+        name = args.name
+    else:
+        while True:
+            name = input("  Provider name: ").strip()
+            if not name:
+                print("  Provider name is required.")
+                continue
+            if " " in name or not name.replace("-", "").replace("_", "").replace(".", "").isalnum():
+                print("  ❌ Invalid name. Use only letters, digits, '-', '_', '.' (no spaces).")
+                continue
+            break
+
+    # --- Display name ---
+    default_display = name.capitalize()
+    display_prompt = f"  Display name [{default_display}]: "
+    display_input = input(display_prompt).strip() if is_tty else ""
+    display_name = display_input or default_display
+
+    # --- Base URL ---
+    base_url = args.base_url or input("  API Base URL: ").strip()
+    if not base_url:
+        logger.error("API Base URL is required")
+        sys.exit(1)
+
+    # --- Auth token ---
+    token = None
+    if is_tty:
+        while True:
+            token_input = getpass.getpass(
+                "  API Token (hidden, Enter to skip): "
+            ).strip()
+            if not token_input:
+                break
+            if token_input.startswith(("http://", "https://")):
+                print(
+                    f"  ⚠️  That looks like a URL, not an API token. "
+                    f"API tokens are usually short strings or JWT tokens. "
+                    f"Use 'pluck model add --base-url {token_input} ...' to set the base URL."
+                )
+                retry = input("  Enter token anyway? [y/N] ").strip().lower()
+                if retry != "y":
+                    continue
+            token = token_input
+            break
+
+    # --- Model tiers (all 3 required) ---
+    print("\n  Model tiers (all required):\n")
+    models: dict[str, ModelTier] = {}
+    tier_order = [
+        ("opus", "Opus model ID"),
+        ("sonnet", "Sonnet model ID"),
+        ("haiku", "Haiku model ID"),
+    ]
+
+    if is_tty:
+        for tier_key, label in tier_order:
+            while True:
+                model_id = input(f"    {label}: ").strip()
+                if model_id:
+                    break
+                print(f"      {tier_key} tier is required. Please enter a model ID.")
+            models[tier_key] = ModelTier(id=model_id)
+        print()
+    elif not models:
+        logger.error("At least one model tier is required")
+        sys.exit(1)
+
+    # --- Default tier ---
+    if is_tty and len(models) > 1:
+        tier_list = "/".join(models.keys())
+        default_tier_choice = next(
+            (t for t in ("sonnet", "haiku", "opus") if t in models), list(models.keys())[0],
+        )
+        df_prompt = f"  Default tier ({tier_list}) [{default_tier_choice}]: "
+        choice = input(df_prompt).strip().lower()
+        default_tier = choice or default_tier_choice
+    else:
+        default_tier = list(models.keys())[0]
+
+    # --- Confirm ---
+    print(f"\n  Provider name:     {name}")
+    print(f"  Display name:      {display_name}")
+    print(f"  API Base URL:      {base_url}")
+    print(f"  API Token:         {'****' if token else '(none)'}")
+    print(f"  Models:            {', '.join(f'{t}={m.id}' for t, m in models.items())}")
+    print(f"  Default tier:      {default_tier}\n")
+
+    if is_tty:
+        confirm = input("  Confirm? [Y/n] ").strip().lower()
+        if confirm and confirm != "y":
+            print("  Cancelled.")
+            return
+
+    config = ProviderConfig(
+        name=name,
+        display_name=display_name,
+        base_url=base_url,
+        models=models,
+        default_tier=default_tier,
+        auth_token=token,
+    )
+
+    try:
+        add_provider(config)
+        logger.info(
+            "✅ Added provider '%s' to ~/.config/pluck/providers.yaml", name,
+        )
+    except ValueError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+
+
+

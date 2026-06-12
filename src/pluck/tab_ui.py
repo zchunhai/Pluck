@@ -501,3 +501,123 @@ def interactive_remove(
             to_remove[comp_type] = set(selected)
 
     return to_remove
+
+
+# ---------------------------------------------------------------------------
+# Simple list selector (no tabs, single selection)
+# ---------------------------------------------------------------------------
+
+
+def select_from_list(
+    items: list[str],
+    current: str | None = None,
+    title: str = "",
+) -> str | None:
+    """Single-select from a list using arrow keys.
+
+    Parameters
+    ----------
+    items:
+        Items to choose from.
+    current:
+        Name of the currently active item (marked with ``*``).
+    title:
+        Header line shown above the list.
+
+    Returns
+    -------
+    str | None
+        Selected item, or ``None`` if the user cancelled.
+    """
+    if not items:
+        return None
+
+    # Non-TTY fallback
+    if not _is_tty():
+        if len(items) == 1:
+            return items[0]
+        return None
+
+    cursor = 0
+    prev_lines = 0
+    term_w = _term_width()
+
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    # Suppress terminal echo
+    fd = sys.stdin.fileno()
+    old_mode = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+
+    try:
+        while True:
+            prev_lines = _render_list_frame(
+                items, current, title, cursor, term_w, prev_lines,
+            )
+
+            key = _read_key()
+
+            if key == "\x03":
+                return None
+            if key in ("q", "Q"):
+                return None
+            if key in ("\r", "\n"):
+                return items[cursor]
+            if key in ("\x1b[A", "k"):
+                cursor = (cursor - 1) % len(items)
+            if key in ("\x1b[B", "j"):
+                cursor = (cursor + 1) % len(items)
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_mode)
+        _clear_frame(prev_lines)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def _render_list_frame(
+    items: list[str],
+    current: str | None,
+    title: str,
+    cursor: int,
+    term_w: int,
+    prev_lines: int,
+) -> int:
+    """Render a single-column selection list, overwriting previous frame."""
+    if prev_lines > 0:
+        sys.stdout.write(f"\x1b[{prev_lines}A")
+
+    lines: list[str] = []
+    if title:
+        lines.append(f"  {BOLD}{title}{RESET}")
+
+    for i, name in enumerate(items):
+        is_current = current and name.lower() == current.lower()
+        is_cursor = i == cursor
+        marker = f"{GREEN}*{RESET}" if is_current else " "
+        ptr = f"{BOLD}>{RESET}" if is_cursor else " "
+        if is_cursor:
+            lines.append(f" {ptr} [{marker}] {BOLD}{name}{RESET}")
+        elif is_current:
+            lines.append(f" {ptr} [{marker}] {GREEN}{name}{RESET}")
+        else:
+            lines.append(f" {ptr} [{marker}] {DIM}{name}{RESET}")
+
+    lines.append(
+        f"{DIM}  [↑↓/jk] move  [enter] select  [q] cancel{RESET}"
+    )
+
+    old_height = prev_lines + 1
+    new_height = len(lines)
+    total = max(old_height, new_height)
+
+    for i in range(total):
+        sys.stdout.write(CLEAR_LINE + "\r")
+        if i < new_height:
+            _write_trunc(lines[i], term_w - 1)
+        if i < total - 1:
+            sys.stdout.write("\n")
+
+    sys.stdout.flush()
+    return total - 1

@@ -39,7 +39,8 @@ Isolate your Claude Code configuration by project. Each environment has its own 
 pluck env create myproject              # Create (auto-activates with shell wrapper)
 pluck env create work --path ~/work     # Create at custom path
 pluck env list                          # List all environments
-pluck env switch coding                 # Switch environment
+pluck env switch                        # TUI selector (arrow keys)
+pluck env switch coding                 # Switch by name
 pluck env switch default                # Switch back to default (~/.claude)
 pluck env delete myproject              # Delete environment
 pluck env init                          # Generate shell wrapper (one-time setup)
@@ -55,6 +56,26 @@ source ~/.zshrc
 > ⚠️ Use `>>` (append), not `>` (overwrite).
 
 With the wrapper active, `pluck env create` and `pluck env switch` automatically set the environment — no manual `eval` needed.
+
+### Model Providers
+
+Switch between AI providers (Anthropic, Zhipu, DeepSeek, etc.) globally or per-environment. Provider configuration is stored in `~/.config/pluck/providers.yaml`.
+
+```bash
+pluck model list                       # List configured providers (* = current)
+pluck model current                    # Show current model configuration
+pluck model switch                     # TUI selector (arrow keys)
+pluck model switch zhipu               # Switch by name
+pluck model switch deepseek --tier sonnet
+pluck model reset                      # Reset to Anthropic
+
+pluck model add                        # Interactive wizard
+pluck model add my-api \               # Or CLI flags for scripting
+  --base-url "https://my-api.com" \
+  --sonnet-model "my-sonnet-v1"
+
+pluck model remove my-api              # Remove provider
+```
 
 ### Plugins
 
@@ -124,7 +145,8 @@ plugins:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLAUDE_CONFIG_DIR` | `~/.claude/` | Claude config dir (auto-set by env switching) |
-| `XDG_CONFIG_HOME` | `~/.config/` | Environment registry location |
+| `PLUCK_CONFIG_DIR` | `$XDG_CONFIG_HOME/pluck` | Provider registry + environment registry location |
+| `XDG_CONFIG_HOME` | `~/.config/` | Fallback for `PLUCK_CONFIG_DIR` |
 | `XDG_CACHE_HOME` | `~/.cache/` | Shared plugin repo cache location |
 
 ## Development
