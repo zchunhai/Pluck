@@ -177,3 +177,37 @@ def _normalize_selection(value: Any) -> list[str] | str:
     if isinstance(value, list):
         return [validate_component_name(v) for v in value]
     raise ValueError(f"Invalid component selection: {value!r}")
+
+
+def remove_from_selection(
+    current: list[str] | str,
+    names_to_remove: set[str],
+    *,
+    all_items: list[str] | None = None,
+) -> list[str] | str:
+    """Remove specific names from a component selection.
+
+    Parameters
+    ----------
+    current:
+        Current selection — a list of names or ``"all"``.
+    names_to_remove:
+        Set of names to remove.
+    all_items:
+        Full list of available items.  Required when *current* is ``"all"``
+        so the function can convert to an explicit list first.
+
+    Returns
+    -------
+    list[str] | str
+        Updated selection (list, or ``"all"`` if nothing was removed).
+    """
+    if current == "all":
+        if all_items is None:
+            raise ValueError("all_items is required when current is 'all'")
+        return [n for n in all_items if n not in names_to_remove]
+
+    if isinstance(current, list):
+        return [n for n in current if n not in names_to_remove]
+
+    return current

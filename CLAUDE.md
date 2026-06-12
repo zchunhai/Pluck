@@ -36,7 +36,7 @@ pluck env delete <name>                    # Delete environment
 pluck env init [--shell zsh|bash]          # Generate shell wrapper
 pluck install [-p NAME] [-y] [--repo URL] [--all] [--dry-run]
 pluck update [-p NAME]
-pluck uninstall <NAME> [-y]
+pluck uninstall <NAME> [-y] [--all] [-t TYPE] [-n NAME] [--dry-run]
 pluck list [-p NAME] [-t TYPE]
 pluck status
 ```

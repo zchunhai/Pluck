@@ -591,3 +591,140 @@ def get_installed_plugins(
             pluck_plugins[name] = entries
 
     return pluck_plugins
+
+
+def scan_installed_components(
+    claude_dir: Path, plugin_name: str
+) -> dict[str, set[str]]:
+    """Scan the installed plugin directory and return what's actually on disk."""
+    install_dir = get_install_dir(plugin_name, claude_dir)
+    result: dict[str, set[str]] = {}
+
+    if not install_dir.exists():
+        return result
+
+    dir_to_type = {
+        "skills": "skills",
+        "agents": "agents",
+        "commands": "commands",
+        "rules": "rules",
+        "hooks": "hooks",
+        "contexts": "contexts",
+    }
+
+    for dir_name, comp_type in dir_to_type.items():
+        comp_dir = install_dir / dir_name
+        if not comp_dir.exists():
+            continue
+        items: set[str] = set()
+        for child in comp_dir.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_dir():
+                items.add(child.name)
+            elif child.is_file() and child.suffix == ".md":
+                if comp_type in ("agents", "commands"):
+                    items.add(child.stem)
+                else:
+                    items.add(child.name)
+            elif child.is_file():
+                items.add(child.name)
+        result[comp_type] = items
+
+    return result
+
+
+def _resolve_installed_component_path(
+    install_dir: Path, comp_type: str, name: str
+) -> Path | None:
+    """Find the filesystem path of an installed component.
+
+    Returns ``None`` if the component does not exist on disk.
+    """
+    subdir = COMPONENT_DIR_MAP.get(comp_type, comp_type)
+    base = install_dir / subdir
+
+    if comp_type == "skills":
+        candidate = base / name
+        if candidate.is_dir():
+            return candidate
+    elif comp_type in ("agents", "commands"):
+        candidate = base / f"{name}.md"
+        if candidate.is_file():
+            return candidate
+    elif comp_type == "hooks":
+        if name == "hooks" and (base / "hooks.json").exists():
+            return base
+    elif comp_type in ("rules", "contexts"):
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def remove_components(
+    plugin_name: str,
+    to_remove: dict[str, set[str]],
+    claude_config_dir: Path | None = None,
+) -> int:
+    """Remove specific components from an installed plugin.
+
+    Parameters
+    ----------
+    plugin_name:
+        Name of the installed plugin.
+    to_remove:
+        Mapping of component type -> set of component names to remove.
+    claude_config_dir:
+        Claude config directory.
+
+    Returns
+    -------
+    int
+        Number of components actually removed from disk.
+    """
+    claude_config_dir = claude_config_dir or get_claude_config_dir()
+    name = validate_plugin_name(plugin_name)
+
+    plugins_base = (claude_config_dir / "plugins" / MARKETPLACE_NAME).resolve()
+    install_dir = _ensure_path_within_base(
+        get_install_dir(name, claude_config_dir), plugins_base
+    )
+
+    if not install_dir.exists():
+        raise ValueError(f"Plugin '{name}' is not installed")
+
+    removed_count = 0
+
+    for comp_type, names in to_remove.items():
+        for comp_name in sorted(names):
+            path = _resolve_installed_component_path(install_dir, comp_type, comp_name)
+            if path is None:
+                logger.warning("  Not found on disk, skipping: %s/%s", comp_type, comp_name)
+                continue
+
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            logger.info("  Removed: %s/%s", comp_type, comp_name)
+            removed_count += 1
+
+    # Clean up hook dependencies when all hooks are removed
+    if "hooks" in to_remove and to_remove["hooks"]:
+        remaining = scan_installed_components(claude_config_dir, name)
+        if not remaining.get("hooks"):
+            for dep in ("scripts", "lib", "node_modules"):
+                dep_path = install_dir / dep
+                if dep_path.exists():
+                    shutil.rmtree(dep_path)
+                    logger.info("  Cleaned up dependency: %s/", dep)
+            for fname in ("package.json", "package-lock.json"):
+                fp = install_dir / fname
+                if fp.exists():
+                    fp.unlink()
+                    logger.info("  Cleaned up dependency: %s", fname)
+
+    logger.info("Removed %d component(s) from '%s'", removed_count, name)
+    return removed_count

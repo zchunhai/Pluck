@@ -25,16 +25,19 @@ from pluck.config import (
     get_install_dir,
     get_repos_dir,
     load_config,
+    remove_from_selection,
     validate_plugin_name,
 )
 from pluck.installer import (
     get_installed_plugins,
     install_plugin,
+    remove_components,
+    scan_installed_components,
     uninstall_plugin,
 )
 from pluck.interactive import save_config as save_interactive_config
 from pluck.repo import clone_or_update, discover_components
-from pluck.tab_ui import interactive_select
+from pluck.tab_ui import interactive_remove, interactive_select
 
 logger = logging.getLogger("pluck")
 
@@ -116,13 +119,31 @@ def main() -> None:
 
     # --- uninstall ---
     uninstall_p = subparsers.add_parser(
-        "uninstall", help="Uninstall pluck-managed plugins"
+        "uninstall", help="Uninstall plugins or remove specific components"
     )
     uninstall_p.add_argument("plugin_name", help="Plugin to uninstall")
     uninstall_p.add_argument(
         "--yes", "-y",
         action="store_true",
-        help="Skip confirmation prompt"
+        help="Skip confirmation prompt",
+    )
+    uninstall_p.add_argument(
+        "-t", "--type",
+        choices=list(COMPONENT_TYPES),
+        help="Component type to remove (requires -n or removes all of that type)",
+    )
+    uninstall_p.add_argument(
+        "-n", "--name",
+        help="Specific component name to remove (requires --type)",
+    )
+    uninstall_p.add_argument(
+        "--all",
+        action="store_true",
+        dest="remove_all",
+        help="Remove the entire plugin (default behavior without -t/-n)",
+    )
+    uninstall_p.add_argument(
+        "--dry-run", action="store_true", help="Preview without removing"
     )
 
     # --- list ---
@@ -312,7 +333,12 @@ def cmd_update(args: argparse.Namespace, claude_dir: Path) -> None:
 
 
 def cmd_uninstall(args: argparse.Namespace, claude_dir: Path) -> None:
-    """Handle 'uninstall' command."""
+    """Handle 'uninstall' command — full plugin removal or component-level removal.
+
+    Without flags: interactive TUI to select components for removal.
+    With --all: full plugin uninstall (original behavior).
+    With -t/-n: remove specific components non-interactively.
+    """
     plugin_name = args.plugin_name
 
     # Check if plugin is installed
@@ -322,18 +348,180 @@ def cmd_uninstall(args: argparse.Namespace, claude_dir: Path) -> None:
         logger.info("To see installed plugins, run: pluck status")
         sys.exit(1)
 
-    # Confirmation prompt
+    # --- Full uninstall (--all or no components left) ---
+    has_component_flags = args.type or args.name
+    if args.remove_all or not has_component_flags:
+        # If --all is explicit, or no -t/-n flags: check if this is a
+        # plain uninstall call (no component flags at all).
+        if args.remove_all or not has_component_flags:
+            # Plain uninstall or --all
+            if has_component_flags and args.remove_all:
+                # User said --all AND -t/-n — just do full uninstall
+                pass
+            elif not args.remove_all and not has_component_flags:
+                # No flags at all → interactive TUI mode
+                _interactive_uninstall(args, plugin_name, claude_dir)
+                return
+
+            # Full uninstall (original behavior)
+            if not args.yes:
+                logger.info("🗑️  Uninstalling: %s (entire plugin)", plugin_name)
+                logger.info("   This will remove plugin files AND its entry from pluck.yaml")
+                response = input("Are you sure? [y/N] ")
+                if response.lower() != "y":
+                    logger.info("Cancelled")
+                    return
+
+            logger.info("🗑️  Uninstalling: %s", plugin_name)
+            uninstall_plugin(plugin_name, claude_dir)
+            logger.info("  ✅ Done")
+            return
+
+    # --- Component-level removal ---
+    _component_uninstall(args, plugin_name, claude_dir)
+
+
+def _interactive_uninstall(
+    args: argparse.Namespace, plugin_name: str, claude_dir: Path
+) -> None:
+    """Interactive TUI mode for selecting components to remove."""
+    installed_set = scan_installed_components(claude_dir, plugin_name)
+    total_installed = sum(len(v) for v in installed_set.values())
+
+    if total_installed == 0:
+        logger.warning("Plugin '%s' has no installed components", plugin_name)
+        logger.info("Use: pluck uninstall %s --all  to remove the plugin entry", plugin_name)
+        return
+
+    to_remove = interactive_remove(plugin_name, installed_set)
+    if to_remove is None:
+        logger.info("Cancelled")
+        return
+
+    total_selected = sum(len(v) for v in to_remove.values())
+    if total_selected == 0:
+        logger.info("Nothing selected for removal")
+        return
+
+    # Check if all components selected → suggest full uninstall
+    total_after = total_installed - total_selected
+    if total_after == 0:
+        logger.warning("All components selected for removal.")
+        logger.info(
+            "Consider using: pluck uninstall %s --all -y  "
+            "(removes plugin entirely including config entry)",
+            plugin_name,
+        )
+
+    if args.dry_run:
+        _show_removal_plan(plugin_name, to_remove)
+        return
+
+    _show_removal_plan(plugin_name, to_remove)
+
     if not args.yes:
-        logger.info("🗑️  Uninstalling: %s", plugin_name)
-        logger.info("   This will remove plugin files AND its entry from pluck.yaml")
-        response = input("Are you sure? [y/N] ")
+        response = input("Proceed with removal? [y/N] ")
         if response.lower() != "y":
             logger.info("Cancelled")
             return
 
-    logger.info("🗑️  Uninstalling: %s", plugin_name)
-    uninstall_plugin(plugin_name, claude_dir)
-    logger.info("  ✅ Done")
+    _execute_removal(args, plugin_name, to_remove, claude_dir)
+
+
+def _component_uninstall(
+    args: argparse.Namespace, plugin_name: str, claude_dir: Path
+) -> None:
+    """Non-interactive component removal via -t/-n flags."""
+    to_remove: dict[str, set[str]] = {}
+
+    if args.name:
+        if not args.type:
+            logger.error("--name requires --type")
+            sys.exit(1)
+        to_remove = {args.type: {args.name}}
+
+    elif args.type:
+        installed_set = scan_installed_components(claude_dir, plugin_name)
+        items_of_type = installed_set.get(args.type, set())
+        if not items_of_type:
+            logger.info("No %s components installed for '%s'", args.type, plugin_name)
+            return
+        to_remove = {args.type: items_of_type}
+
+    total = sum(len(v) for v in to_remove.values())
+    if total == 0:
+        logger.info("Nothing to remove")
+        return
+
+    if args.dry_run:
+        _show_removal_plan(plugin_name, to_remove)
+        return
+
+    _show_removal_plan(plugin_name, to_remove)
+
+    if not args.yes:
+        response = input("Proceed with removal? [y/N] ")
+        if response.lower() != "y":
+            logger.info("Cancelled")
+            return
+
+    _execute_removal(args, plugin_name, to_remove, claude_dir)
+
+
+def _show_removal_plan(
+    plugin_name: str, to_remove: dict[str, set[str]]
+) -> None:
+    """Display what will be removed."""
+    logger.info("Removing from '%s':", plugin_name)
+    for comp_type in sorted(to_remove):
+        for name in sorted(to_remove[comp_type]):
+            logger.info("  - %s/%s", comp_type, name)
+
+
+def _execute_removal(
+    args: argparse.Namespace,
+    plugin_name: str,
+    to_remove: dict[str, set[str]],
+    claude_dir: Path,
+) -> None:
+    """Execute component removal and update config."""
+    removed_count = remove_components(plugin_name, to_remove, claude_dir)
+
+    # Update pluck.yaml
+    config = load_config()
+    plugin_cfg = _find_plugin_config(config, plugin_name)
+    if plugin_cfg is not None:
+        installed_set = scan_installed_components(claude_dir, plugin_name)
+        for comp_type, names in to_remove.items():
+            current = plugin_cfg["components"].get(comp_type, [])
+            all_items = sorted(installed_set.get(comp_type, set()) | names)
+            plugin_cfg["components"][comp_type] = remove_from_selection(
+                current, names, all_items=all_items
+            )
+        save_interactive_config(get_default_config_path(), config["plugins"])
+        logger.info("  Config updated")
+
+    logger.info("  ✅ Removed %d component(s) from '%s'", removed_count, plugin_name)
+
+    # Warn if plugin is now empty
+    remaining = scan_installed_components(claude_dir, plugin_name)
+    if not any(remaining.values()):
+        logger.warning(
+            "Plugin '%s' has no remaining components. "
+            "Consider: pluck uninstall %s --all",
+            plugin_name, plugin_name,
+        )
+
+
+def _find_plugin_config(
+    config: dict[str, Any], name: str
+) -> dict[str, Any] | None:
+    """Find a plugin's config entry by name (case-insensitive)."""
+    name_lower = name.lower()
+    for p in config["plugins"]:
+        if p["name"].lower() == name_lower:
+            return p
+    return None
 
 
 def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
@@ -350,7 +538,7 @@ def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
             )
             continue
 
-        installed_set = _scan_installed_components(claude_dir, plugin["name"])
+        installed_set = scan_installed_components(claude_dir, plugin["name"])
 
         logger.info("📦 %s", plugin["name"])
         components = discover_components(repo_dir)
@@ -539,49 +727,6 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
         logger.error(
             "Unknown env action. Available: create, list, switch, init, delete"
         )
-
-
-def _scan_installed_components(
-    claude_dir: Path, plugin_name: str
-) -> dict[str, set[str]]:
-    """Scan the installed plugin directory and return what's actually on disk."""
-    install_dir = get_install_dir(plugin_name, claude_dir)
-    result: dict[str, set[str]] = {}
-
-    if not install_dir.exists():
-        return result
-
-    dir_to_type = {
-        "skills": "skills",
-        "agents": "agents",
-        "commands": "commands",
-        "rules": "rules",
-        "hooks": "hooks",
-        "contexts": "contexts",
-    }
-
-    for dir_name, comp_type in dir_to_type.items():
-        comp_dir = install_dir / dir_name
-        if not comp_dir.exists():
-            continue
-        items: set[str] = set()
-        for child in comp_dir.iterdir():
-            if child.name.startswith("."):
-                continue
-            if child.is_dir():
-                items.add(child.name)
-            elif child.is_file() and child.suffix == ".md":
-                # agents and commands use stem (no .md); contexts and rules
-                # keep the full filename to match discovery naming.
-                if comp_type in ("agents", "commands"):
-                    items.add(child.stem)
-                else:
-                    items.add(child.name)
-            elif child.is_file():
-                items.add(child.name)
-        result[comp_type] = items
-
-    return result
 
 
 def _is_installed(

@@ -69,8 +69,11 @@ pluck install --repo <url> --all # Add + install all components
 pluck update                     # Update repos and reinstall all
 pluck update -p ecc              # Update one plugin
 
-pluck uninstall ecc              # Uninstall (prompts for confirmation)
-pluck uninstall -y ecc           # Uninstall without prompt
+pluck uninstall ecc              # Interactive: select components to remove
+pluck uninstall ecc --all        # Remove entire plugin
+pluck uninstall ecc --all -y     # Remove entire plugin (no prompt)
+pluck uninstall ecc -t skills -n react-patterns  # Remove specific component
+pluck uninstall ecc -t hooks     # Remove all hooks
 
 pluck list                       # Show all (✓ installed, ⚠ configured, · available)
 pluck list -p ecc                # Show one plugin

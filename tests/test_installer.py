@@ -15,6 +15,8 @@ from pluck.installer import (
     _read_original_manifest,
     get_installed_plugins,
     install_plugin,
+    remove_components,
+    scan_installed_components,
     uninstall_plugin,
 )
 
@@ -273,3 +275,126 @@ class TestUninstallPlugin:
 
         result = uninstall_plugin("testplug", claude_dir)
         assert result is True
+
+
+# ─── remove_components ──────────────────────────────────────────
+
+
+class TestRemoveComponents:
+    def _make_installed_plugin(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Create a fake installed plugin with multiple component types."""
+        claude_dir = tmp_path / "claude"
+        claude_dir.mkdir()
+        (claude_dir / "plugins").mkdir()
+        (claude_dir / "settings.json").write_text("{}")
+
+        install_dir = (
+            claude_dir / "plugins" / MARKETPLACE_NAME / "testplug"
+        )
+        install_dir.mkdir(parents=True)
+
+        # skills
+        skills = install_dir / "skills"
+        skills.mkdir()
+        (skills / "skill-a").mkdir()
+        (skills / "skill-a" / "SKILL.md").write_text("# A")
+        (skills / "skill-b").mkdir()
+        (skills / "skill-b" / "SKILL.md").write_text("# B")
+
+        # agents
+        agents = install_dir / "agents"
+        agents.mkdir()
+        (agents / "reviewer.md").write_text("# Reviewer")
+        (agents / "architect.md").write_text("# Architect")
+
+        # hooks
+        hooks = install_dir / "hooks"
+        hooks.mkdir()
+        (hooks / "hooks.json").write_text("{}")
+
+        # scripts (hook dependency)
+        (install_dir / "scripts").mkdir()
+        (install_dir / "scripts" / "run.sh").write_text("#!/bin/sh")
+        (install_dir / "package.json").write_text("{}")
+
+        return claude_dir, install_dir
+
+    def test_removes_skill_directory(self, tmp_path: Path) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        count = remove_components(
+            "testplug", {"skills": {"skill-a"}}, claude_dir
+        )
+        assert count == 1
+        assert not (install_dir / "skills" / "skill-a").exists()
+        assert (install_dir / "skills" / "skill-b").exists()
+
+    def test_removes_agent_md_file(self, tmp_path: Path) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        count = remove_components(
+            "testplug", {"agents": {"reviewer"}}, claude_dir
+        )
+        assert count == 1
+        assert not (install_dir / "agents" / "reviewer.md").exists()
+        assert (install_dir / "agents" / "architect.md").exists()
+
+    def test_removes_multiple_types(self, tmp_path: Path) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        count = remove_components(
+            "testplug",
+            {"skills": {"skill-a"}, "agents": {"architect"}},
+            claude_dir,
+        )
+        assert count == 2
+
+    def test_cleans_up_hook_deps(self, tmp_path: Path) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        remove_components("testplug", {"hooks": {"hooks"}}, claude_dir)
+        assert not (install_dir / "scripts").exists()
+        assert not (install_dir / "package.json").exists()
+
+    def test_preserves_hook_deps_if_hooks_remain(
+        self, tmp_path: Path
+    ) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        remove_components("testplug", {"skills": {"skill-a"}}, claude_dir)
+        assert (install_dir / "scripts").exists()
+        assert (install_dir / "package.json").exists()
+
+    def test_raises_if_not_installed(self, tmp_path: Path) -> None:
+        claude_dir = tmp_path / "claude"
+        claude_dir.mkdir()
+        (claude_dir / "plugins").mkdir()
+        with pytest.raises(ValueError, match="not installed"):
+            remove_components("ghost", {"skills": {"x"}}, claude_dir)
+
+    def test_noop_for_nonexistent_component(self, tmp_path: Path) -> None:
+        claude_dir, install_dir = self._make_installed_plugin(tmp_path)
+        count = remove_components(
+            "testplug", {"skills": {"nonexistent"}}, claude_dir
+        )
+        assert count == 0
+
+
+# ─── scan_installed_components ───────────────────────────────────
+
+
+class TestScanInstalledComponents:
+    def test_returns_empty_for_missing(self, tmp_path: Path) -> None:
+        result = scan_installed_components(tmp_path, "ghost")
+        assert result == {}
+
+    def test_detects_skills_and_agents(self, tmp_path: Path) -> None:
+        install_dir = (
+            tmp_path / "plugins" / MARKETPLACE_NAME / "testplug"
+        )
+        install_dir.mkdir(parents=True)
+
+        (install_dir / "skills" / "myskill").mkdir(parents=True)
+        (install_dir / "skills" / "myskill" / "SKILL.md").write_text("#")
+
+        (install_dir / "agents").mkdir()
+        (install_dir / "agents" / "rev.md").write_text("#")
+
+        result = scan_installed_components(tmp_path, "testplug")
+        assert "myskill" in result["skills"]
+        assert "rev" in result["agents"]

@@ -287,3 +287,43 @@ class TestLoadConfig:
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(tmp_path)}):
             result = load_config()
         assert result["plugins"] == []
+
+
+# ─── remove_from_selection ──────────────────────────────────────
+
+
+class TestRemoveFromSelection:
+    def test_removes_from_explicit_list(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection(["a", "b", "c"], {"b"})
+        assert result == ["a", "c"]
+
+    def test_converts_all_to_explicit_list(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection("all", {"b"}, all_items=["a", "b", "c"])
+        assert result == ["a", "c"]
+
+    def test_all_requires_all_items(self) -> None:
+        from pluck.config import remove_from_selection
+        with pytest.raises(ValueError, match="all_items"):
+            remove_from_selection("all", {"b"})
+
+    def test_empty_result(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection(["a"], {"a"})
+        assert result == []
+
+    def test_no_match(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection(["a", "b"], {"z"})
+        assert result == ["a", "b"]
+
+    def test_empty_remove_set(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection(["a", "b"], set())
+        assert result == ["a", "b"]
+
+    def test_all_removes_everything(self) -> None:
+        from pluck.config import remove_from_selection
+        result = remove_from_selection("all", {"a", "b"}, all_items=["a", "b"])
+        assert result == []

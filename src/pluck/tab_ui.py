@@ -453,3 +453,51 @@ def interactive_select(
     print(f"\n{BOLD}📦 {plugin_name}{RESET} ({total_counts})")
 
     return _select_with_tabs(plugin_name, available, current_components)
+
+
+def interactive_remove(
+    plugin_name: str,
+    installed_components: dict[str, set[str]],
+) -> dict[str, set[str]] | None:
+    """Interactively select components to remove using a tab-based UI.
+
+    Shows only components currently installed on disk.  Items start
+    un-checked; the user toggles items ON to mark them for removal.
+
+    Returns a dict of ``{comp_type: set(names_to_remove)}``, or ``None``
+    if the user aborts.
+    """
+    from pluck.config import COMPONENT_TYPES
+
+    # Convert sets to lists for the TUI (which expects list items)
+    available: dict[str, list[str]] = {}
+    current_components: dict[str, Any] = {}
+    for comp_type in COMPONENT_TYPES:
+        items = sorted(installed_components.get(comp_type, set()))
+        if items:
+            available[comp_type] = items
+            # Start with nothing selected — user picks what to remove
+            current_components[comp_type] = []
+
+    if not available:
+        print("  No installed components found.")
+        return {}
+
+    total_counts = " | ".join(
+        f"{len(items)} {t}" for t, items in available.items() if items
+    )
+    print(f"\n{BOLD}🗑️  Remove from {plugin_name}{RESET} ({total_counts})")
+    print(f"  {DIM}Toggle items ON to mark for removal{RESET}")
+
+    result = _select_with_tabs(plugin_name, available, current_components)
+    if result is None:
+        return None
+
+    # Compute what was selected (i.e. what to remove)
+    to_remove: dict[str, set[str]] = {}
+    for comp_type in COMPONENT_TYPES:
+        selected = result.get(comp_type, [])
+        if selected:
+            to_remove[comp_type] = set(selected)
+
+    return to_remove
