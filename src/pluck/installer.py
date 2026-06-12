@@ -36,11 +36,27 @@ def _ensure_path_within_base(target: Path, base: Path) -> Path:
     """Resolve ``target`` and verify it lies within ``base``.
 
     Returns the resolved path.  Raises ``ValueError`` if the resolved
-    target escapes the allowed base directory.
+    target escapes the allowed base directory or if a symlink is
+    encountered in the path components (prevents traversal attacks).
     """
+    # Resolve without following the final symlink, then walk every
+    # component from the target upward to detect symlink-based
+    # directory traversal attacks.
     resolved = target.resolve()
+    base_resolved = base.resolve()
+
+    check = resolved
+    while check != check.parent:
+        if check.is_symlink():
+            raise ValueError(
+                f"Symlink detected in path (potential traversal): {check}"
+            )
+        if check == base_resolved:
+            break
+        check = check.parent
+
     try:
-        resolved.relative_to(base.resolve())
+        resolved.relative_to(base_resolved)
     except ValueError:
         raise ValueError(
             f"Path escapes allowed directory: {target} -> {resolved}"
