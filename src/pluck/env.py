@@ -351,8 +351,33 @@ pluck() {
     case "$1" in
         env)
             case "$2" in
-                create|switch)
-                    eval "$(command pluck "$@")"
+                create)
+                    # Skip eval for help flags to avoid shell parsing errors
+                    case "$*" in
+                        *"-h"*|*"--help"*)
+                            command pluck "$@"
+                            ;;
+                        *)
+                            eval "$(command pluck "$@")"
+                            ;;
+                    esac
+                    ;;
+                switch)
+                    # For switch, run directly when TUI needed (no name provided)
+                    # so the interactive selector can access the terminal.
+                    # Eval only when switching to a specific environment.
+                    if [ -z "$3" ]; then
+                        command pluck "$@"
+                    else
+                        case "$*" in
+                            *"-h"*|*"--help"*)
+                                command pluck "$@"
+                                ;;
+                            *)
+                                eval "$(command pluck "$@")"
+                                ;;
+                        esac
+                    fi
                     ;;
                 *)
                     command pluck "$@"
