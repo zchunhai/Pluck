@@ -34,6 +34,7 @@ from pluck.installer import (
     remove_components,
     scan_installed_components,
     uninstall_plugin,
+    _get_plugin_source_from_marketplace,
 )
 from pluck.interactive import save_config as save_interactive_config
 from pluck.repo import clone_or_update, discover_components
@@ -260,12 +261,58 @@ def _extract_plugin_name(repo_url: str) -> str:
     return name.lower()
 
 
+def _extract_org_and_name(repo_url: str) -> tuple[str, str]:
+    """Extract organization and repo name from a git repo URL.
+
+    Returns:
+        Tuple of (org, repo_name) preserving original case.
+        If no organization is found, returns ("_unknown", repo_name).
+
+    Examples:
+        https://github.com/mattpocock/skills.git              -> ("mattpocock", "skills")
+        https://github.com/Egonex-AI/Understand-Anything     -> ("Egonex-AI", "Understand-Anything")
+        git@github.com:obra/superpowers.git                  -> ("obra", "superpowers")
+    """
+    clean = repo_url.rstrip("/").removesuffix(".git")
+
+    # Handle SSH format: git@github.com:user/repo
+    if "@" in clean and ":" in clean:
+        # SSH format: extract after the colon
+        git_part, repo_part = clean.split(":", maxsplit=1)
+        parts = repo_part.rstrip("/").rsplit("/", maxsplit=1)
+        if len(parts) == 2:
+            org, repo = parts
+            # Remove any remaining port/host info
+            if "@" in org:
+                org = org.rsplit("@", maxsplit=1)[-1]
+            return org, repo
+        else:
+            # Only repo name, no org
+            return "_unknown", parts[0]
+
+    # HTTPS format
+    parts = clean.rstrip("/").rsplit("/", maxsplit=2)
+
+    if len(parts) >= 3:
+        # Has org/repo format
+        org = parts[-2]
+        repo = parts[-1]
+    else:
+        # No org, just repo
+        org = "_unknown"
+        repo = parts[-1]
+
+    return org, repo
+
+
 def _ensure_repo_in_config(args: argparse.Namespace) -> None:
     """Add a plugin from --repo URL to config file if not already present."""
     _validate_repo_url(args.repo)
-    name = validate_plugin_name(
-        args.plugin or _extract_plugin_name(args.repo)
-    )
+    org, repo_name = _extract_org_and_name(args.repo)
+
+    # Use -p argument as the plugin's display name, or fall back to repo name
+    name = validate_plugin_name(args.plugin) if args.plugin else repo_name
+
     config_path = get_default_config_path()
 
     config = load_config()
@@ -286,6 +333,8 @@ def _ensure_repo_in_config(args: argparse.Namespace) -> None:
         "repo": args.repo,
         "branch": args.branch,
         "components": components,
+        "org": org,  # Store org for repo path construction
+        "repo_base_name": repo_name,  # Store original repo name
     }
 
     config["plugins"].append(new_plugin)
@@ -320,13 +369,25 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
     for plugin in _filter_plugins(config, args.plugin):
         logger.info("📦 Processing: %s", plugin["name"])
 
-        repo_dir = repos_dir / plugin["name"]
+        # If --all flag is set and plugin has empty components, populate with "all"
+        if args.install_all and not any(plugin["components"].values()):
+            logger.info("  Populating empty selection with all components")
+            for comp_type in COMPONENT_TYPES:
+                plugin["components"][comp_type] = "all"
+            changed = True
+
+        # Build repo path: repos_dir/org/repo_base_name
+        repo_dir = repos_dir / plugin["org"] / plugin["repo_base_name"]
+
         try:
             sha = clone_or_update(plugin["repo"], repo_dir, plugin["branch"])
             logger.info("  Repo at commit: %s", sha)
         except RuntimeError as e:
             logger.error("  Failed: %s", e)
             continue
+
+        # Adjust repo_dir based on marketplace.json source field
+        source_dir = _get_plugin_source_from_marketplace(repo_dir, plugin["name"])
 
         # Interactive selection: default on, skip with --yes or --repo --all
         is_repo_plugin = args.repo and (
@@ -342,7 +403,7 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
                 "    (or use: pluck install -y for non-interactive)"
             )
             new_components = interactive_select(
-                plugin["name"], repo_dir, plugin["components"]
+                plugin["name"], source_dir, plugin["components"]
             )
             if new_components is None:
                 logger.info("  ⚠ Aborted, skipping install for '%s'", plugin["name"])
@@ -355,7 +416,7 @@ def cmd_install(args: argparse.Namespace, claude_dir: Path) -> None:
                 logger.info("  No changes for '%s'", plugin["name"])
 
         if args.dry_run:
-            _show_dry_run(plugin, repo_dir)
+            _show_dry_run(plugin, source_dir)
         else:
             install_plugin(plugin, repo_dir, claude_dir)
             logger.info("  ✅ '%s' installed\n", plugin["name"])
@@ -584,7 +645,9 @@ def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
         installed_set = scan_installed_components(claude_dir, plugin["name"])
 
         logger.info("📦 %s", plugin["name"])
-        components = discover_components(repo_dir)
+        # Adjust repo_dir based on marketplace.json source field
+        source_dir = _get_plugin_source_from_marketplace(repo_dir, plugin["name"])
+        components = discover_components(source_dir)
 
         for comp_type, items in components.items():
             if args.type and comp_type != args.type:

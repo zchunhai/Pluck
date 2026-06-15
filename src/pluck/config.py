@@ -43,13 +43,18 @@ def validate_plugin_name(name: str) -> str:
 
 
 def validate_component_name(name: str) -> str:
-    """Validate a component name.  Rejects path separators and control chars."""
+    """Validate a component name.
+
+    Allows forward slashes for nested skills (e.g., "engineering/diagnose").
+    Rejects backslashes, control chars, and reserved names.
+    """
     if not name or not isinstance(name, str):
         raise ValueError(f"Component name must be a non-empty string, got: {name!r}")
-    if "/" in name or "\\" in name or "\x00" in name:
-        raise ValueError(f"Component name contains path separators: {name!r}")
-    if name in (".", ".."):
-        raise ValueError(f"Component name is reserved: {name!r}")
+    if "\\" in name or "\x00" in name:
+        raise ValueError(f"Component name contains invalid characters: {name!r}")
+    # Reject reserved names that could cause security issues
+    if name in (".", "..") or name.startswith("../") or name.startswith("./.."):
+        raise ValueError(f"Component name is reserved or unsafe: {name!r}")
     return name
 
 
@@ -156,11 +161,20 @@ def validate_plugin(plugin: dict[str, Any], index: int) -> dict[str, Any]:
     for comp_type in COMPONENT_TYPES:
         normalized[comp_type] = _normalize_selection(components.get(comp_type))
 
+    # Ensure org and repo_base_name fields exist (migration from old configs)
+    if "org" not in plugin:
+        org, repo_base_name = _extract_org_and_name_from_repo(repo)
+    else:
+        org = plugin["org"]
+        repo_base_name = plugin.get("repo_base_name", name)
+
     return {
         "name": name,
         "repo": repo,
         "branch": plugin.get("branch", "main"),
         "components": normalized,
+        "org": org,
+        "repo_base_name": repo_base_name,
     }
 
 
@@ -177,6 +191,50 @@ def _normalize_selection(value: Any) -> list[str] | str:
     if isinstance(value, list):
         return [validate_component_name(v) for v in value]
     raise ValueError(f"Invalid component selection: {value!r}")
+
+
+def _extract_org_and_name_from_repo(repo_url: str) -> tuple[str, str]:
+    """Extract organization and repo name from a git repo URL.
+
+    Returns:
+        Tuple of (org, repo_name) preserving original case.
+        If no organization is found, returns ("_unknown", repo_name).
+
+    Examples:
+        https://github.com/mattpocock/skills.git              -> ("mattpocock", "skills")
+        https://github.com/Egonex-AI/Understand-Anything     -> ("Egonex-AI", "Understand-Anything")
+        git@github.com:obra/superpowers.git                  -> ("obra", "superpowers")
+    """
+    clean = repo_url.rstrip("/").removesuffix(".git")
+
+    # Handle SSH format: git@github.com:user/repo
+    if "@" in clean and ":" in clean:
+        # SSH format: extract after the colon
+        git_part, repo_part = clean.split(":", maxsplit=1)
+        parts = repo_part.rstrip("/").rsplit("/", maxsplit=1)
+        if len(parts) == 2:
+            org, repo = parts
+            # Remove any remaining port/host info
+            if "@" in org:
+                org = org.rsplit("@", maxsplit=1)[-1]
+            return org, repo
+        else:
+            # Only repo name, no org
+            return "_unknown", parts[0]
+
+    # HTTPS format
+    parts = clean.rstrip("/").rsplit("/", maxsplit=2)
+
+    if len(parts) >= 3:
+        # Has org/repo format
+        org = parts[-2]
+        repo = parts[-1]
+    else:
+        # No org, just repo
+        org = "_unknown"
+        repo = parts[-1]
+
+    return org, repo
 
 
 def remove_from_selection(

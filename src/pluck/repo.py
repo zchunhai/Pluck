@@ -102,28 +102,50 @@ def discover_components(repo_dir: Path) -> dict[str, list[str]]:
 
 
 def _scan_component_dir(comp_type: str, comp_dir: Path) -> list[str]:
-    """Scan a component directory and return item names."""
+    """Scan a component directory and return item names.
+
+    For skills, searches recursively to find directories containing SKILL.md.
+    For other types, searches only one level deep.
+    """
     items: list[str] = []
 
-    for child in sorted(comp_dir.iterdir()):
-        name = child.name
-        if name.startswith(".") or name == "README.md":
-            continue
+    def scan_skills_recursive(directory: Path, prefix: str = "") -> None:
+        """Recursively search for skills (directories containing SKILL.md)."""
+        for child in sorted(directory.iterdir()):
+            name = child.name
+            if name.startswith(".") or name == "README.md":
+                continue
 
-        if comp_type == "skills":
-            if child.is_dir() and (child / "SKILL.md").exists():
+            if child.is_dir():
+                # Check if this is a skill (contains SKILL.md)
+                if (child / "SKILL.md").exists():
+                    skill_name = f"{prefix}{name}" if prefix else name
+                    items.append(skill_name)
+                else:
+                    # Recursively search subdirectories
+                    new_prefix = f"{prefix}{name}/" if prefix else f"{name}/"
+                    scan_skills_recursive(child, new_prefix)
+
+    if comp_type == "skills":
+        scan_skills_recursive(comp_dir)
+    else:
+        # Non-skill components: single-level scan
+        for child in sorted(comp_dir.iterdir()):
+            name = child.name
+            if name.startswith(".") or name == "README.md":
+                continue
+
+            if comp_type == "hooks":
+                if name == "hooks.json":
+                    items.append("hooks")
+            elif comp_type in ("agents", "commands"):
+                if child.is_file() and child.suffix == ".md":
+                    items.append(child.stem)
+            elif comp_type == "rules":
+                if child.is_dir() or (child.is_file() and child.suffix == ".md"):
+                    items.append(name)
+            elif comp_type == "contexts" and (child.is_file() or child.is_dir()):
                 items.append(name)
-        elif comp_type == "hooks":
-            if name == "hooks.json":
-                items.append("hooks")
-        elif comp_type in ("agents", "commands"):
-            if child.is_file() and child.suffix == ".md":
-                items.append(child.stem)
-        elif comp_type == "rules":
-            if child.is_dir() or (child.is_file() and child.suffix == ".md"):
-                items.append(name)
-        elif comp_type == "contexts" and (child.is_file() or child.is_dir()):
-            items.append(name)
 
     return items
 
@@ -164,13 +186,17 @@ def resolve_component_paths(
 def _find_component(
     repo_dir: Path, search_paths: list[str], comp_type: str, name: str
 ) -> Path | None:
-    """Find a specific component in the repo by searching known paths."""
+    """Find a specific component in the repo by searching known paths.
+
+    For skills, handles nested paths like "category/subcategory/skill-name".
+    """
     for search_path in search_paths:
         base = repo_dir / search_path
         if not base.is_dir():
             continue
 
         if comp_type == "skills":
+            # Handle nested skill paths (e.g., "engineering/diagnose")
             candidate = base / name
             if candidate.is_dir() and (candidate / "SKILL.md").exists():
                 return candidate

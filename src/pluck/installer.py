@@ -17,7 +17,7 @@ from pluck.config import (
     validate_plugin_name,
 )
 from pluck.io_utils import atomic_write_json, safe_load_json
-from pluck.repo import discover_components, get_commit_sha, resolve_component_paths
+from pluck.repo import discover_components, get_commit_sha, resolve_component_paths, COMPONENT_SEARCH_PATHS, _find_component
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,87 @@ def _ensure_path_within_base(target: Path, base: Path) -> Path:
     return resolved
 
 
+def _get_plugin_source_from_marketplace(repo_dir: Path, plugin_name: str) -> Path:
+    """Read marketplace.json and extract the source directory for a plugin.
+
+    Args:
+        repo_dir: Path to the cloned repository.
+        plugin_name: Name of the plugin to find in marketplace.json.
+
+    Returns:
+        Path to the plugin source directory (relative to repo_dir).
+        Returns repo_dir if no marketplace.json or if source is "./".
+    """
+    marketplace_file = repo_dir / ".claude-plugin" / "marketplace.json"
+    if not marketplace_file.exists():
+        logger.debug("No marketplace.json found in %s, using repo root", repo_dir)
+        return repo_dir
+
+    try:
+        with open(marketplace_file, encoding="utf-8") as f:
+            marketplace = cast(dict[str, Any], json.load(f))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read marketplace.json: %s", e)
+        return repo_dir
+
+    # Find the plugin entry in the plugins array
+    plugins = marketplace.get("plugins", [])
+
+    # Try exact match first (for when plugin name matches marketplace entry)
+    for plugin in plugins:
+        if plugin.get("name") == plugin_name:
+            source = plugin.get("source", "./")
+            # Normalize the source path
+            if source == "./" or source == ".":
+                logger.debug("Plugin '%s' source is root", plugin_name)
+                return repo_dir
+            elif source.startswith("./"):
+                plugin_dir = repo_dir / source[2:]  # Remove leading "./"
+                if plugin_dir.is_dir():
+                    logger.debug("Plugin '%s' source: %s", plugin_name, source)
+                    return plugin_dir
+                else:
+                    logger.warning(
+                        "Plugin source directory not found: %s, using repo root",
+                        plugin_dir
+                    )
+                    return repo_dir
+            else:
+                logger.warning("Invalid source path '%s', using repo root", source)
+                return repo_dir
+
+    # No exact match: use the first plugin entry (handles renamed plugins via -p)
+    if plugins:
+        first_plugin = plugins[0]
+        actual_name = first_plugin.get("name", "unknown")
+        source = first_plugin.get("source", "./")
+        logger.debug(
+            "Plugin '%s' not found in marketplace, using first entry '%s'",
+            plugin_name, actual_name
+        )
+        # Normalize the source path
+        if source == "./" or source == ".":
+            logger.debug("First plugin source is root")
+            return repo_dir
+        elif source.startswith("./"):
+            plugin_dir = repo_dir / source[2:]  # Remove leading "./"
+            if plugin_dir.is_dir():
+                logger.debug("Using first plugin source: %s", source)
+                return plugin_dir
+            else:
+                logger.warning(
+                    "First plugin source directory not found: %s, using repo root",
+                    plugin_dir
+                )
+                return repo_dir
+        else:
+            logger.warning("Invalid source path '%s', using repo root", source)
+            return repo_dir
+
+    logger.debug("No plugins in marketplace.json, using repo root")
+    return repo_dir
+
+
 def install_plugin(
     plugin_config: dict[str, Any],
     repo_dir: Path,
@@ -80,6 +161,10 @@ def install_plugin(
     claude_config_dir = claude_config_dir or get_claude_config_dir()
     name = validate_plugin_name(plugin_config["name"])
     components = plugin_config["components"]
+    org = plugin_config.get("org", "Unknown")  # Get org for author fallback
+
+    # Adjust repo_dir based on marketplace.json source field
+    repo_dir = _get_plugin_source_from_marketplace(repo_dir, name)
 
     _check_conflicts(name, claude_config_dir)
 
@@ -93,8 +178,8 @@ def install_plugin(
 
     install_dir.mkdir(parents=True, exist_ok=True)
 
-    _create_plugin_manifest(install_dir, name, repo_dir)
-    _create_marketplace_manifest(install_dir, name, claude_config_dir)
+    _create_plugin_manifest(install_dir, name, repo_dir, org)
+    _create_marketplace_manifest(install_dir, name, claude_config_dir, org)
     _copy_plugin_metadata(repo_dir, install_dir)
 
     installed_count = 0
@@ -106,20 +191,44 @@ def install_plugin(
         if not source_paths:
             continue
 
-        target_subdir = COMPONENT_DIR_MAP.get(comp_type, comp_type)
-        target_dir = install_dir / target_subdir
+        # Build name->path mapping. For "all", resolve_component_paths
+        # discovers names internally; for lists, names are in selection.
+        if selection == "all":
+            all_components = discover_components(repo_dir)
+            names = all_components.get(comp_type, [])
+        else:
+            names = list(selection)
+
+        # Create a mapping from leaf names to full names for lookup
+        path_to_name: dict[str, str] = {}
+        for comp_name in names:
+            source = _find_component(repo_dir, COMPONENT_SEARCH_PATHS[comp_type], comp_type, comp_name)
+            if source is not None:
+                path_to_name[str(source.resolve())] = comp_name
+
+        # Rules go to ~/.claude/rules/<plugin>/ (so Claude Code can auto-load them)
+        # Everything else goes into the plugin install directory
+        if comp_type == "rules":
+            target_dir = claude_config_dir / "rules" / name
+        else:
+            target_subdir = COMPONENT_DIR_MAP.get(comp_type, comp_type)
+            target_dir = install_dir / target_subdir
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for source_path in source_paths:
-            dest = target_dir / source_path.name
+            # Use the full component name (preserving nested path) as dest name
+            comp_name = path_to_name.get(str(source_path.resolve()), source_path.name)
+            dest = target_dir / comp_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
             if source_path.is_dir():
                 if dest.exists():
                     shutil.rmtree(dest)
                 shutil.copytree(source_path, dest)
             else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, dest)
             installed_count += 1
-            logger.info("  Installed: %s/%s", comp_type, source_path.name)
+            logger.info("  Installed: %s/%s", comp_type, comp_name)
 
     _warn_missing_components(repo_dir, components)
 
@@ -170,9 +279,25 @@ def _check_conflicts(name: str, claude_config_dir: Path) -> None:
             )
 
 
-def _create_plugin_manifest(install_dir: Path, name: str, repo_dir: Path) -> None:
-    """Create .claude-plugin/plugin.json for the filtered plugin."""
+def _create_plugin_manifest(install_dir: Path, name: str, repo_dir: Path, org: str) -> None:
+    """Create .claude-plugin/plugin.json for the filtered plugin.
+
+    Args:
+        install_dir: Target installation directory.
+        name: Plugin name.
+        repo_dir: Source repository directory.
+        org: Repository organization (used as author fallback).
+    """
     original = _read_original_manifest(repo_dir)
+
+    # Ensure author field has proper structure with name
+    author = original.get("author")
+    if not author or not isinstance(author, dict):
+        author = {"name": org}
+    elif "name" not in author or not author["name"]:
+        # Author field exists but missing name or name is empty
+        author = dict(author)  # Make a copy to avoid mutating original
+        author["name"] = org
 
     manifest = {
         "name": name,
@@ -180,7 +305,7 @@ def _create_plugin_manifest(install_dir: Path, name: str, repo_dir: Path) -> Non
             "description", f"Pluck-managed selective installation of {name}"
         ),
         "version": original.get("version", "0.1.0"),
-        "author": original.get("author", {}),
+        "author": author,
     }
 
     manifest_dir = install_dir / ".claude-plugin"
@@ -191,7 +316,7 @@ def _create_plugin_manifest(install_dir: Path, name: str, repo_dir: Path) -> Non
 
 
 def _create_marketplace_manifest(
-    install_dir: Path, name: str, claude_config_dir: Path
+    install_dir: Path, name: str, claude_config_dir: Path, org: str
 ) -> None:
     """Create or update the marketplace manifest for pluck.
 
@@ -200,6 +325,12 @@ def _create_marketplace_manifest(
 
     Each plugin entry needs a ``source`` field pointing to the plugin
     subdirectory relative to the marketplace root.
+
+    Args:
+        install_dir: Target installation directory.
+        name: Plugin name.
+        claude_config_dir: Claude config directory.
+        org: Repository organization (used as author fallback).
 
     Structure:
       plugins/pluck/                       ← marketplace root
@@ -231,24 +362,40 @@ def _create_marketplace_manifest(
         marketplace = _new_marketplace_template()
 
     # Check if this plugin is already in the marketplace list
-    plugin_exists = any(
-        p.get("name") == name for p in marketplace.get("plugins", [])
-    )
+    plugin_exists = False
+    plugin_idx = None
+    for i, p in enumerate(marketplace.get("plugins", [])):
+        if p.get("name") == name:
+            plugin_exists = True
+            plugin_idx = i
+            break
 
-    if not plugin_exists:
-        # Build plugin entry with correct source path
-        plugin_manifest = install_dir / ".claude-plugin" / "plugin.json"
-        if plugin_manifest.exists():
-            with open(plugin_manifest, encoding="utf-8") as f:
-                plugin_data = cast(dict[str, Any], json.load(f))
-        else:
-            plugin_data = {"name": name}
+    # Build plugin entry with correct source path
+    plugin_manifest = install_dir / ".claude-plugin" / "plugin.json"
+    if plugin_manifest.exists():
+        with open(plugin_manifest, encoding="utf-8") as f:
+            plugin_data = cast(dict[str, Any], json.load(f))
+    else:
+        plugin_data = {"name": name}
 
-        # source is relative to the marketplace root (plugins/pluck/)
-        plugin_data["source"] = f"./{name}"
+    # Ensure author field has proper structure with name
+    author = plugin_data.get("author")
+    if not author or not isinstance(author, dict):
+        plugin_data["author"] = {"name": org}
+    elif "name" not in author or not author["name"]:
+        plugin_data["author"] = dict(author)
+        plugin_data["author"]["name"] = org
 
+    # source is relative to the marketplace root (plugins/pluck/)
+    plugin_data["source"] = f"./{name}"
+
+    if plugin_idx is not None:
+        # Update existing entry to fix source format and author
+        marketplace["plugins"][plugin_idx] = plugin_data
+    else:
         marketplace.setdefault("plugins", []).append(plugin_data)
-        atomic_write_json(marketplace_file, marketplace)
+
+    atomic_write_json(marketplace_file, marketplace)
 
     # Register the marketplace in Claude's global settings so that
     # /plugins can discover it. Claude stores local marketplace
@@ -495,6 +642,12 @@ def uninstall_plugin(name: str, claude_config_dir: Path | None = None) -> bool:
         shutil.rmtree(install_dir)
         logger.info("Removed plugin directory: %s", install_dir)
 
+    # Also remove rules from ~/.claude(-envs/<env>)/rules/<plugin>/
+    rules_dir = claude_config_dir / "rules" / name_lower
+    if rules_dir.exists():
+        shutil.rmtree(rules_dir)
+        logger.info("Removed rules directory: %s", rules_dir)
+
     plugins_file = claude_config_dir / "plugins" / "installed_plugins.json"
     if plugins_file.exists():
         data = safe_load_json(plugins_file)
@@ -596,11 +749,16 @@ def get_installed_plugins(
 def scan_installed_components(
     claude_dir: Path, plugin_name: str
 ) -> dict[str, set[str]]:
-    """Scan the installed plugin directory and return what's actually on disk."""
+    """Scan the installed plugin directory and return what's actually on disk.
+
+    For skills, recursively searches to find nested directory structures.
+    For rules, scans ~/.claude/rules/<plugin>/ (the auto-load path).
+    """
+    plugin_name = validate_plugin_name(plugin_name)
     install_dir = get_install_dir(plugin_name, claude_dir)
     result: dict[str, set[str]] = {}
 
-    if not install_dir.exists():
+    if not install_dir.exists() and not (claude_dir / "rules" / plugin_name).exists():
         return result
 
     dir_to_type = {
@@ -612,37 +770,72 @@ def scan_installed_components(
         "contexts": "contexts",
     }
 
-    for dir_name, comp_type in dir_to_type.items():
-        comp_dir = install_dir / dir_name
-        if not comp_dir.exists():
-            continue
+    def scan_skills_recursive(directory: Path, prefix: str = "") -> set[str]:
+        """Recursively scan for skill directories containing SKILL.md."""
         items: set[str] = set()
-        for child in comp_dir.iterdir():
+        for child in sorted(directory.iterdir()):
             if child.name.startswith("."):
                 continue
             if child.is_dir():
-                items.add(child.name)
-            elif child.is_file() and child.suffix == ".md":
-                if comp_type in ("agents", "commands"):
-                    items.add(child.stem)
+                # Check if this is a skill (contains SKILL.md)
+                if (child / "SKILL.md").exists():
+                    skill_name = f"{prefix}{child.name}" if prefix else child.name
+                    items.add(skill_name)
                 else:
+                    # Recursively search subdirectories
+                    new_prefix = f"{prefix}{child.name}/" if prefix else f"{child.name}/"
+                    items.update(scan_skills_recursive(child, new_prefix))
+        return items
+
+    for dir_name, comp_type in dir_to_type.items():
+        if comp_type == "rules":
+            # Rules are installed to ~/.claude/rules/<plugin>/
+            comp_dir = claude_dir / "rules" / plugin_name
+        else:
+            comp_dir = install_dir / dir_name
+
+        if not comp_dir.exists():
+            continue
+
+        if comp_type == "skills":
+            # Use recursive scan for skills
+            result[comp_type] = scan_skills_recursive(comp_dir)
+        else:
+            # Single-level scan for other component types
+            items: set[str] = set()
+            for child in comp_dir.iterdir():
+                if child.name.startswith("."):
+                    continue
+                if child.is_dir():
                     items.add(child.name)
-            elif child.is_file():
-                items.add(child.name)
-        result[comp_type] = items
+                elif child.is_file() and child.suffix == ".md":
+                    if comp_type in ("agents", "commands"):
+                        items.add(child.stem)
+                    else:
+                        items.add(child.name)
+                elif child.is_file():
+                    items.add(child.name)
+            result[comp_type] = items
 
     return result
 
 
 def _resolve_installed_component_path(
-    install_dir: Path, comp_type: str, name: str
+    install_dir: Path, comp_type: str, name: str, claude_dir: Path | None = None
 ) -> Path | None:
     """Find the filesystem path of an installed component.
 
+    For rules, looks in ``claude_dir/rules/<plugin>/`` (auto-load path).
+    For other types, looks in the plugin install directory.
+
     Returns ``None`` if the component does not exist on disk.
     """
-    subdir = COMPONENT_DIR_MAP.get(comp_type, comp_type)
-    base = install_dir / subdir
+    if comp_type == "rules" and claude_dir is not None:
+        plugin_name = install_dir.name  # install_dir ends with plugin name
+        base = claude_dir / "rules" / plugin_name
+    else:
+        subdir = COMPONENT_DIR_MAP.get(comp_type, comp_type)
+        base = install_dir / subdir
 
     if comp_type == "skills":
         candidate = base / name
@@ -699,7 +892,7 @@ def remove_components(
 
     for comp_type, names in to_remove.items():
         for comp_name in sorted(names):
-            path = _resolve_installed_component_path(install_dir, comp_type, comp_name)
+            path = _resolve_installed_component_path(install_dir, comp_type, comp_name, claude_config_dir)
             if path is None:
                 logger.warning("  Not found on disk, skipping: %s/%s", comp_type, comp_name)
                 continue
