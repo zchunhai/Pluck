@@ -17,7 +17,7 @@ from pluck.config import (
     validate_plugin_name,
 )
 from pluck.io_utils import atomic_write_json, safe_load_json
-from pluck.repo import discover_components, get_commit_sha, resolve_component_paths, COMPONENT_SEARCH_PATHS, _find_component
+from pluck.repo import discover_components, get_commit_sha, resolve_component_paths
 
 logger = logging.getLogger(__name__)
 
@@ -191,21 +191,6 @@ def install_plugin(
         if not source_paths:
             continue
 
-        # Build name->path mapping. For "all", resolve_component_paths
-        # discovers names internally; for lists, names are in selection.
-        if selection == "all":
-            all_components = discover_components(repo_dir)
-            names = all_components.get(comp_type, [])
-        else:
-            names = list(selection)
-
-        # Create a mapping from leaf names to full names for lookup
-        path_to_name: dict[str, str] = {}
-        for comp_name in names:
-            source = _find_component(repo_dir, COMPONENT_SEARCH_PATHS[comp_type], comp_type, comp_name)
-            if source is not None:
-                path_to_name[str(source.resolve())] = comp_name
-
         # Rules go to ~/.claude/rules/<plugin>/ (so Claude Code can auto-load them)
         # Everything else goes into the plugin install directory
         if comp_type == "rules":
@@ -216,10 +201,9 @@ def install_plugin(
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for source_path in source_paths:
-            # Use the full component name (preserving nested path) as dest name
-            comp_name = path_to_name.get(str(source_path.resolve()), source_path.name)
-            dest = target_dir / comp_name
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Use source_path.name (leaf name) so Claude Code can find skills
+            # directly under skills/<name>/. The config preserves the nested path.
+            dest = target_dir / source_path.name
             if source_path.is_dir():
                 if dest.exists():
                     shutil.rmtree(dest)
@@ -228,7 +212,7 @@ def install_plugin(
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, dest)
             installed_count += 1
-            logger.info("  Installed: %s/%s", comp_type, comp_name)
+            logger.info("  Installed: %s/%s", comp_type, source_path.name)
 
     _warn_missing_components(repo_dir, components)
 
