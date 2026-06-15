@@ -756,7 +756,9 @@ def cmd_env(args: argparse.Namespace, claude_dir: Path) -> None:
         else:
             logger.info("⚠️  This will delete environment '%s' and its contents.", name)
 
-        response = input("Are you sure? [y/N] ")
+        # Use print for better visibility
+        print("Are you sure? [y/N] ", end="", flush=True)
+        response = input()
         if response.lower() != "y":
             logger.info("Cancelled")
             return

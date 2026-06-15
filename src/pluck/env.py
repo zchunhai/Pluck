@@ -221,10 +221,14 @@ def delete_env(name: str) -> None:
     currently active, it will be automatically deactivated by switching to
     default before deletion.
 
+    This function handles both registered environments and orphaned directories
+    (directories that exist but are not in the registry).
+
     Raises
     ------
     ValueError
-        If the environment is not found or is the default environment.
+        If the environment is not found in both registry and filesystem,
+        or is the default environment.
     """
     if name.lower() == DEFAULT_ENV_NAME.lower():
         raise ValueError(
@@ -235,25 +239,39 @@ def delete_env(name: str) -> None:
     name_lower = name.lower()
     environments = _load_registry()
 
+    # Try to find in registry first
     idx: int | None = None
     for i, entry in enumerate(environments):
         if entry["name"].lower() == name_lower:
             idx = i
             break
 
-    if idx is None:
-        raise ValueError(f"Environment not found: '{name}'")
+    if idx is not None:
+        # Registered environment: remove from registry and filesystem
+        entry = environments[idx]
+        env_path = Path(entry["path"])
 
-    entry = environments[idx]
-    env_path = Path(entry["path"])
+        if env_path.exists():
+            shutil.rmtree(env_path)
+            logger.info("Removed environment directory: %s", env_path)
 
-    if env_path.exists():
+        del environments[idx]
+        _save_registry(environments)
+        logger.info("Removed '%s' from registry", entry["name"])
+        return
+
+    # Not in registry: check if orphaned directory exists
+    env_path = DEFAULT_ENV_HOME / name
+    if env_path.exists() and env_path.is_dir():
         shutil.rmtree(env_path)
-        logger.info("Removed environment directory: %s", env_path)
+        logger.info(
+            "Removed orphaned directory: %s (not in registry)",
+            env_path
+        )
+        return
 
-    del environments[idx]
-    _save_registry(environments)
-    logger.info("Removed '%s' from registry", entry["name"])
+    # Not found anywhere
+    raise ValueError(f"Environment not found: '{name}'")
 
 
 def list_envs() -> list[EnvironmentEntry]:
@@ -358,26 +376,44 @@ pluck() {
     case "$1" in
         env)
             case "$2" in
-                create|delete|switch)
-                    # Eval output for auto-activation, auto-switch, and environment switching
+                create)
+                    # Eval output for auto-activation
                     # Skip eval for help to avoid parse errors
-                    # Skip eval for switch with no args (TUI mode needs terminal access)
                     case "$*" in
                         *"-h"*|*"--help"*)
                             command pluck "$@"
-                            ;;
-                        "env switch"*|"env switch ")
-                            # TUI mode: no environment name provided ($3 is empty)
-                            if [ -z "$3" ]; then
-                                command pluck "$@"
-                            else
-                                eval "$(command pluck "$@")"
-                            fi
                             ;;
                         *)
                             eval "$(command pluck "$@")"
                             ;;
                     esac
+                    ;;
+                delete)
+                    # Run directly to ensure prompt visibility
+                    case "$*" in
+                        *"-h"*|*"--help"*)
+                            command pluck "$@"
+                            ;;
+                        *)
+                            command pluck "$@"
+                            ;;
+                    esac
+                    ;;
+                switch)
+                    # For switch, run directly when TUI needed (no name provided)
+                    # Eval only when switching to a specific environment
+                    if [ -z "$3" ]; then
+                        command pluck "$@"
+                    else
+                        case "$*" in
+                            *"-h"*|*"--help"*)
+                                command pluck "$@"
+                                ;;
+                            *)
+                                eval "$(command pluck "$@")"
+                                ;;
+                        esac
+                    fi
                     ;;
                 *)
                     command pluck "$@"
