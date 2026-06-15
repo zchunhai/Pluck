@@ -201,18 +201,27 @@ def install_plugin(
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for source_path in source_paths:
-            # Use source_path.name (leaf name) so Claude Code can find skills
-            # directly under skills/<name>/. The config preserves the nested path.
-            dest = target_dir / source_path.name
             if source_path.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(source_path, dest)
+                if comp_type == "hooks":
+                    # Hooks: merge contents into target_dir (avoid hooks/hooks/ nesting)
+                    _copy_dir_contents(source_path, target_dir)
+                    installed_count += 1
+                    logger.info("  Installed: %s/hooks", comp_type)
+                else:
+                    # Skills, rules dirs: copy as named subdirectory
+                    dest = target_dir / source_path.name
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(source_path, dest)
+                    installed_count += 1
+                    logger.info("  Installed: %s/%s", comp_type, source_path.name)
             else:
+                # Files (agents, commands, rules .md, contexts): copy directly
+                dest = target_dir / source_path.name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, dest)
-            installed_count += 1
-            logger.info("  Installed: %s/%s", comp_type, source_path.name)
+                installed_count += 1
+                logger.info("  Installed: %s/%s", comp_type, source_path.name)
 
     _warn_missing_components(repo_dir, components)
 
@@ -228,6 +237,24 @@ def install_plugin(
     _register_plugin(name, install_dir, commit_sha, claude_config_dir)
 
     return install_dir
+
+
+def _copy_dir_contents(source: Path, dest: Path) -> None:
+    """Copy all contents of *source* directory into *dest* directory.
+
+    Unlike shutil.copytree, this merges into an existing *dest* instead of
+    creating a subdirectory. Existing items in *dest* are overwritten.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        target = dest / item.name
+        if item.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(item, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
 
 
 def _warn_missing_components(repo_dir: Path, components: dict[str, Any]) -> None:
