@@ -217,14 +217,21 @@ def create_env(
 def delete_env(name: str) -> None:
     """Delete an environment's directory and remove it from the registry.
 
-    Callers should handle the case where the target environment is currently
-    active (e.g., switch to default first).
+    The default environment cannot be deleted. If the target environment is
+    currently active, it will be automatically deactivated by switching to
+    default before deletion.
 
     Raises
     ------
     ValueError
-        If the environment is not found.
+        If the environment is not found or is the default environment.
     """
+    if name.lower() == DEFAULT_ENV_NAME.lower():
+        raise ValueError(
+            f"Cannot delete the default environment ('{DEFAULT_ENV_NAME}'). "
+            f"It is protected and required for proper operation."
+        )
+
     name_lower = name.lower()
     environments = _load_registry()
 
@@ -351,33 +358,26 @@ pluck() {
     case "$1" in
         env)
             case "$2" in
-                create)
-                    # Skip eval for help flags to avoid shell parsing errors
+                create|delete|switch)
+                    # Eval output for auto-activation, auto-switch, and environment switching
+                    # Skip eval for help to avoid parse errors
+                    # Skip eval for switch with no args (TUI mode needs terminal access)
                     case "$*" in
                         *"-h"*|*"--help"*)
                             command pluck "$@"
+                            ;;
+                        "env switch"*|"env switch ")
+                            # TUI mode: no environment name provided ($3 is empty)
+                            if [ -z "$3" ]; then
+                                command pluck "$@"
+                            else
+                                eval "$(command pluck "$@")"
+                            fi
                             ;;
                         *)
                             eval "$(command pluck "$@")"
                             ;;
                     esac
-                    ;;
-                switch)
-                    # For switch, run directly when TUI needed (no name provided)
-                    # so the interactive selector can access the terminal.
-                    # Eval only when switching to a specific environment.
-                    if [ -z "$3" ]; then
-                        command pluck "$@"
-                    else
-                        case "$*" in
-                            *"-h"*|*"--help"*)
-                                command pluck "$@"
-                                ;;
-                            *)
-                                eval "$(command pluck "$@")"
-                                ;;
-                        esac
-                    fi
                     ;;
                 *)
                     command pluck "$@"
