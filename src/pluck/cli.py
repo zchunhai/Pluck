@@ -646,7 +646,15 @@ def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
 
         logger.info("📦 %s", plugin["name"])
         # Adjust repo_dir based on marketplace.json source field
-        source_dir = _get_plugin_source_from_marketplace(repo_dir, plugin["name"])
+        try:
+            source_dir = _get_plugin_source_from_marketplace(repo_dir, plugin["name"])
+        except ValueError as e:
+            # Plugin name doesn't match marketplace.json (likely renamed incorrectly)
+            logger.warning("  ⚠️  Cannot list components: %s", str(e))
+            logger.info("     Tip: For multi-plugin repos, use exact name from marketplace.json")
+            logger.info("     Or re-install with: pluck install -p <exact-name> --repo <url> --all")
+            logger.info("")
+            continue
         components = discover_components(source_dir)
 
         for comp_type, items in components.items():
