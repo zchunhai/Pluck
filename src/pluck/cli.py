@@ -634,7 +634,14 @@ def cmd_list(args: argparse.Namespace, claude_dir: Path) -> None:
     repos_dir = get_repos_dir(claude_dir)
 
     for plugin in _filter_plugins(config, args.plugin):
-        repo_dir = repos_dir / plugin["name"]
+        # Build repo path: use org/repo_base_name if available, otherwise extract from repo URL
+        if plugin.get("org") and plugin.get("repo_base_name"):
+            repo_dir = repos_dir / plugin["org"] / plugin["repo_base_name"]
+        else:
+            # Fallback for old configs: extract from repo URL
+            org, repo_name = _extract_org_and_name(plugin["repo"])
+            repo_dir = repos_dir / org / repo_name
+
         if not repo_dir.exists():
             logger.info(
                 "📦 %s: not cloned yet. Run 'pluck install' first.",
