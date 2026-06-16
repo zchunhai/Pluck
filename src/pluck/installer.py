@@ -113,33 +113,41 @@ def _get_plugin_source_from_marketplace(repo_dir: Path, plugin_name: str) -> Pat
                 logger.warning("Invalid source path '%s', using repo root", source)
                 return repo_dir
 
-    # No exact match: use the first plugin entry (handles renamed plugins via -p)
-    if plugins:
+    # No exact match found
+    if len(plugins) == 1:
+        # Only one plugin: allow renaming via -p parameter
         first_plugin = plugins[0]
         actual_name = first_plugin.get("name", "unknown")
         source = first_plugin.get("source", "./")
         logger.debug(
-            "Plugin '%s' not found in marketplace, using first entry '%s'",
-            plugin_name, actual_name
+            "Single-plugin repo: '%s' renamed to '%s', using source: %s",
+            actual_name, plugin_name, source
         )
         # Normalize the source path
         if source == "./" or source == ".":
-            logger.debug("First plugin source is root")
+            logger.debug("Single plugin source is root")
             return repo_dir
         elif source.startswith("./"):
             plugin_dir = repo_dir / source[2:]  # Remove leading "./"
             if plugin_dir.is_dir():
-                logger.debug("Using first plugin source: %s", source)
+                logger.debug("Using single plugin source: %s", source)
                 return plugin_dir
             else:
                 logger.warning(
-                    "First plugin source directory not found: %s, using repo root",
+                    "Single plugin source directory not found: %s, using repo root",
                     plugin_dir
                 )
                 return repo_dir
         else:
             logger.warning("Invalid source path '%s', using repo root", source)
             return repo_dir
+    elif len(plugins) > 1:
+        # Multiple plugins but no exact match: error
+        available = ", ".join([p.get("name", "unknown") for p in plugins])
+        raise ValueError(
+            f"Repo contains multiple plugins. Please specify exact name. "
+            f"Available: {available}. You specified: '{plugin_name}'"
+        )
 
     logger.debug("No plugins in marketplace.json, using repo root")
     return repo_dir

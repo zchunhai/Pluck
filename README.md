@@ -103,6 +103,33 @@ pluck list -t skills             # Filter by component type
 pluck status                     # Show active environment and installed plugins
 ```
 
+### Monorepo Plugins
+
+Some repositories contain multiple plugins (e.g., [pm-skills](https://github.com/phuryn/pm-skills) with 9 PM plugins). Install each sub-plugin separately:
+
+```bash
+# List all sub-plugins in a monorepo
+pluck install --repo https://github.com/phuryn/pm-skills
+
+# Install a specific sub-plugin (must use exact name)
+pluck install -p pm-product-discovery --repo https://github.com/phuryn/pm-skills --all
+pluck install -p pm-product-strategy --repo https://github.com/phuryn/pm-skills --all
+pluck install -p pm-execution --repo https://github.com/phuryn/pm-skills --all
+```
+
+**Plugin naming rules:**
+- **Multiple plugins in repo**: Must use exact name from marketplace.json
+- **Single plugin in repo**: Can rename with `-p` for convenience
+
+```bash
+# Single plugin: can rename
+pluck install -p my-custom-name --repo https://github.com/affaan-m/ECC.git --all
+
+# Multiple plugins: must use exact name
+pluck install -p pm-product-discovery --repo https://github.com/phuryn/pm-skills --all  ✓
+pluck install -p pm-discovery --repo https://github.com/phuryn/pm-skills --all     ✗ (error)
+```
+
 ## Configuration
 
 Config file: `$CLAUDE_CONFIG_DIR/pluck.yaml` — see [`pluck.yaml.example`](pluck.yaml.example) for a full example.
